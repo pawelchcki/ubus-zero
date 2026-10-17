@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/no-std-rs/ubus-zero/compare/ubus-zero-v0.3.0...ubus-zero-v0.3.1) (2026-10-17)
+
+
+### Performance Improvements
+
+* reduce large-message broker receive overhead ([#26](https://github.com/no-std-rs/ubus-zero/issues/26)) ([6030e3b](https://github.com/no-std-rs/ubus-zero/commit/6030e3bf7e9532ce7ba32553db9bdd803a27c439))
+
 ## [0.3.0](https://github.com/no-std-rs/ubus-zero/compare/ubus-zero-v0.2.0...ubus-zero-v0.3.0) (2026-10-16)
 
 
