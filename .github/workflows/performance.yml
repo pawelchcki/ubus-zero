@@ -12,6 +12,10 @@ on:
         description: Optional Git commit/ref for a before-and-after Rust comparison
         type: string
         required: false
+      profile_matrix:
+        description: Compare Rust release opt-level z, s, 2 and 3
+        type: boolean
+        default: false
   schedule:
     - cron: '0 7 * * 1'
 
@@ -52,15 +56,22 @@ jobs:
         env:
           BENCHMARK_EVENT: ${{ github.event_name }}
           BENCHMARK_BASE_REF: ${{ inputs.baseline_ref }}
+          BENCHMARK_PROFILE_MATRIX: ${{ inputs.profile_matrix }}
         run: |
+          profile_args=()
+          if [ "$BENCHMARK_PROFILE_MATRIX" = true ]; then
+            profile_args+=(--profile-matrix)
+          fi
           if [ "$BENCHMARK_EVENT" = pull_request ]; then
             python3 tools/ubus-benchmark.py --smoke
           elif [ -n "$BENCHMARK_BASE_REF" ]; then
-            python3 tools/ubus-benchmark.py --baseline-ref "$BENCHMARK_BASE_REF"
+            python3 tools/ubus-benchmark.py --baseline-ref "$BENCHMARK_BASE_REF" "${profile_args[@]}"
           else
-            python3 tools/ubus-benchmark.py
+            python3 tools/ubus-benchmark.py "${profile_args[@]}"
           fi
           cat dist/benchmarks/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Record routing allocations and churn retention
+        run: cargo run --release --locked -p ubusd --example footprint > dist/benchmarks/footprint.json
       - name: Upload comparison and raw samples
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

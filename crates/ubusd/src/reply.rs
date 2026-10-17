@@ -1,5 +1,5 @@
 use ubus::envelope::{find, EnvBuilder, MonitorAttr, UbusAttr};
-use ubus::wire::{Frame, Header, MsgType};
+use ubus::wire::{Frame, FrameRef, Header, MsgType};
 
 use crate::registry::{ObjectId, ObjectType, PeerId};
 
@@ -110,6 +110,10 @@ pub fn obj_id_data(
 /// DATA frame before sending the terminating STATUS(0), preserving
 /// the request version byte and payload while changing only the type.
 pub fn data_echo(request: &Frame) -> Frame {
+    data_echo_ref(&FrameRef::from(request))
+}
+
+pub(crate) fn data_echo_ref(request: &FrameRef<'_>) -> Frame {
     Frame {
         hdr: Header {
             version: request.hdr.version,
@@ -117,7 +121,7 @@ pub fn data_echo(request: &Frame) -> Frame {
             seq: request.hdr.seq,
             peer: request.hdr.peer,
         },
-        payload: request.payload.clone(),
+        payload: request.payload.to_vec(),
     }
 }
 
@@ -205,7 +209,16 @@ pub fn stamped_invoke(
     data: Option<&[u8]>,
     no_reply: bool,
 ) -> Frame {
-    let mut env = EnvBuilder::new();
+    let capacity = 4
+        + 8
+        + usize::from(no_reply) * 8
+        + [method, user, group]
+            .into_iter()
+            .flatten()
+            .map(|value| ubus::blob::align4(5 + value.len()))
+            .sum::<usize>()
+        + data.map_or(0, |value| ubus::blob::align4(4 + value.len()));
+    let mut env = EnvBuilder::with_capacity(capacity);
     if no_reply {
         env.push_u8(UbusAttr::NoReply, 1);
     }
@@ -232,16 +245,26 @@ pub fn stamped_forwarded_invoke(
     user: Option<&str>,
     group: Option<&str>,
 ) -> Frame {
+    stamped_forwarded_invoke_ref(&FrameRef::from(frame), caller, obj_id, user, group)
+}
+
+pub(crate) fn stamped_forwarded_invoke_ref(
+    frame: &FrameRef<'_>,
+    caller: PeerId,
+    obj_id: ObjectId,
+    user: Option<&str>,
+    group: Option<&str>,
+) -> Frame {
     // Probed upstream: caller INVOKE never forwards UBUS_ATTR_NO_REPLY
     // to the owner.
     stamped_invoke(
         frame.hdr.seq,
         caller,
         obj_id,
-        find(&frame.payload, UbusAttr::Method).and_then(|a| a.as_str()),
+        find(frame.payload, UbusAttr::Method).and_then(|a| a.as_str()),
         user,
         group,
-        find(&frame.payload, UbusAttr::Data).map(|a| a.payload),
+        find(frame.payload, UbusAttr::Data).map(|a| a.payload),
         false,
     )
 }

@@ -84,16 +84,28 @@ impl Default for EnvBuilder {
 
 impl EnvBuilder {
     pub fn new() -> Self {
-        let mut buf = Vec::with_capacity(32);
+        Self::with_capacity(32)
+    }
+
+    /// Reserve the complete envelope to avoid growth while forwarding payloads.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut buf = Vec::with_capacity(capacity.max(4));
         buf.extend_from_slice(&[0u8; 4]);
         Self { buf }
     }
 
     pub fn push_str(&mut self, id: UbusAttr, val: &str) {
-        let mut payload = Vec::with_capacity(val.len() + 1);
-        payload.extend_from_slice(val.as_bytes());
-        payload.push(0);
-        self.push(id, &payload);
+        let length = 4 + val.len() + 1;
+        assert!(
+            length <= LEN_MASK as usize,
+            "attribute exceeds 24-bit length field"
+        );
+        self.buf
+            .extend_from_slice(&(((id as u32) << 24) | length as u32).to_be_bytes());
+        self.buf.extend_from_slice(val.as_bytes());
+        self.buf.push(0);
+        self.buf
+            .resize(self.buf.len() + blob::align4(length) - length, 0);
     }
 
     pub fn push_u32(&mut self, id: UbusAttr, val: u32) {
@@ -295,9 +307,27 @@ pub fn unwrap(frame_payload: &[u8]) -> Result<&[u8], UbusError> {
     Ok(&frame_payload[4..total])
 }
 
+/// Last attribute accepted by the pinned ubusd/libubox policy. Invalid
+/// duplicates are skipped, so they do not hide an earlier valid value.
 pub fn find(frame_payload: &[u8], id: UbusAttr) -> Option<EnvAttr<'_>> {
     let inner = unwrap(frame_payload).ok()?;
-    iter_attrs(inner).find(|a| a.id == id as u8)
+    iter_attrs(inner).filter(|a| policy_accepts(a, id)).last()
+}
+
+fn policy_accepts(attr: &EnvAttr<'_>, id: UbusAttr) -> bool {
+    if attr.id != id as u8 {
+        return false;
+    }
+    match id {
+        UbusAttr::Status | UbusAttr::ObjId | UbusAttr::ObjType => attr.payload.len() == 4,
+        UbusAttr::ObjPath | UbusAttr::Method | UbusAttr::User | UbusAttr::Group => {
+            attr.payload.last() == Some(&0)
+        }
+        // ubusd's ubus_policy leaves Target, Active and NoReply UNSPEC.
+        // Their widths are not filtered: e.g. a later u32 NoReply=1 is
+        // accepted and its first byte (zero) overrides an earlier INT8=1.
+        _ => true,
+    }
 }
 
 /// Like `find` but distinguishes "envelope malformed" from "attr
@@ -308,12 +338,13 @@ pub fn find(frame_payload: &[u8], id: UbusAttr) -> Option<EnvAttr<'_>> {
 pub fn try_find(frame_payload: &[u8], id: UbusAttr) -> Result<Option<EnvAttr<'_>>, UbusError> {
     let inner = unwrap(frame_payload)?;
     let mut it = iter_attrs(inner);
+    let mut found = None;
     while let Some(a) = it.try_next()? {
-        if a.id == id as u8 {
-            return Ok(Some(a));
+        if policy_accepts(&a, id) {
+            found = Some(a);
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Decode an `i32` STATUS attr or surface a Malformed envelope. Returns
@@ -331,6 +362,31 @@ pub fn read_status(frame_payload: &[u8]) -> Result<i32, UbusError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_policy_skips_invalid_values_and_selects_last_valid() {
+        let mut env = EnvBuilder::new();
+        env.push_u32(UbusAttr::ObjId, 7);
+        env.push_bytes_id(UbusAttr::ObjId as u8, &[0, 0, 0, 9, 0]);
+        env.push_u32(UbusAttr::ObjId, 11);
+        env.push_bytes_id(UbusAttr::ObjId as u8, &[0]);
+        env.push_str(UbusAttr::Method, "first");
+        env.push_str(UbusAttr::Method, "last");
+        env.push_bytes_id(UbusAttr::Method as u8, b"invalid");
+        let bytes = env.finish();
+        assert_eq!(
+            find(&bytes, UbusAttr::ObjId).and_then(|a| a.as_u32()),
+            Some(11)
+        );
+        assert_eq!(
+            find(&bytes, UbusAttr::Method).and_then(|a| a.as_str()),
+            Some("last")
+        );
+        assert_eq!(
+            try_find(&bytes, UbusAttr::ObjId).unwrap().unwrap().as_u32(),
+            Some(11)
+        );
+    }
 
     #[test]
     fn build_and_iter_round_trip() {

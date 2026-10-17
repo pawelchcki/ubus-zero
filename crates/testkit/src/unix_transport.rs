@@ -4,7 +4,6 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
@@ -18,29 +17,41 @@ use ubus::wire::{Codec, Frame, HEADER_SIZE, MAX_MSG_LEN};
 pub struct UnixUbusTransport {
     stream: UnixStream,
     rx_buf: Vec<u8>,
+    read_buffer: Vec<u8>,
 }
 
 impl UnixUbusTransport {
     pub fn connect(path: impl AsRef<Path>) -> Result<Self, UbusError> {
+        Self::connect_with_read_buffer(path, 2048)
+    }
+
+    /// Benchmark endpoints can reserve larger reads once, outside measurement.
+    pub fn connect_with_read_buffer(
+        path: impl AsRef<Path>,
+        bytes: usize,
+    ) -> Result<Self, UbusError> {
+        if !(1..=64 * 1024).contains(&bytes) {
+            return Err(UbusError::Malformed("invalid read buffer size"));
+        }
         let stream = UnixStream::connect(path).map_err(io_error)?;
         stream.set_nonblocking(true).map_err(io_error)?;
         Ok(Self {
             stream,
             rx_buf: Vec::with_capacity(1024),
+            read_buffer: vec![0; bytes],
         })
     }
 
     fn fill_rx(&mut self) -> Result<bool, UbusError> {
         const RX_BUF_CAP: usize = MAX_MSG_LEN * 2;
-        let mut chunk = [0_u8; 2048];
         loop {
-            match self.stream.read(&mut chunk) {
+            match self.stream.read(&mut self.read_buffer) {
                 Ok(0) => return Ok(true),
                 Ok(n) => {
                     if self.rx_buf.len().saturating_add(n) > RX_BUF_CAP {
                         return Err(UbusError::Malformed("rx buffer exceeded cap"));
                     }
-                    self.rx_buf.extend_from_slice(&chunk[..n]);
+                    self.rx_buf.extend_from_slice(&self.read_buffer[..n]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -64,7 +75,22 @@ impl Transport for UnixUbusTransport {
                     if Instant::now() >= deadline {
                         return Err(UbusError::Io("send timed out".into()));
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    let fd = unsafe { BorrowedFd::borrow_raw(self.stream.as_raw_fd()) };
+                    let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let timeout = Timespec {
+                        tv_sec: remaining.as_secs() as _,
+                        tv_nsec: remaining.subsec_nanos() as _,
+                    };
+                    match poll(&mut fds, Some(&timeout)) {
+                        Ok(_) => {}
+                        Err(rustix::io::Errno::INTR) => {}
+                        Err(error) => {
+                            return Err(io_error(io::Error::from_raw_os_error(
+                                error.raw_os_error(),
+                            )))
+                        }
+                    }
                 }
                 Err(error) => return Err(io_error(error)),
             }
@@ -140,6 +166,7 @@ mod tests {
             UnixUbusTransport {
                 stream,
                 rx_buf: Vec::new(),
+                read_buffer: vec![0; 2048],
             },
         )
     }

@@ -30,7 +30,7 @@ Scenarios without broker-assigned IDs are compared as raw bytes.
 
 | Evidence | What it covers |
 | --- | --- |
-| 184 checked-in golden transcripts | 109 ACL and 75 protocol scenarios recorded from the pinned C broker; replayed against Rust without OpenWrt fixtures |
+| 186 checked-in golden transcripts | 109 ACL and 77 protocol scenarios recorded from the pinned C broker; replayed against Rust without OpenWrt fixtures |
 | Live differential matrix | The same scenarios run against both brokers. Live runs also check that the goldens still match the pinned binaries. |
 | Real OpenWrt consumers | The `ubus` CLI, libubus callers and providers, rpcd sessions, UCI and the rpcd file plugin |
 | Fault profiles | Fragmented client streams and injected `EINTR` across the strict suite, plus file-descriptor passing at framing boundaries |

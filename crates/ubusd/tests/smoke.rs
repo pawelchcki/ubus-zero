@@ -401,9 +401,6 @@ fn fd_relay_leaves_no_fd_behind_after_cycles() {
     let caller = FdPeer::connect(&path).expect("caller connect");
     let _caller_peer = fd_hello(&caller);
 
-    let before = std::fs::read_dir("/proc/self/fd")
-        .expect("open /proc/self/fd")
-        .count();
     for seq in 10..42 {
         let (read_end, write_end) = pipe().expect("pipe");
         fd_send(&caller, &fd_invoke(seq, obj, &[]), Some(write_end.as_fd()));
@@ -427,20 +424,13 @@ fn fd_relay_leaves_no_fd_behind_after_cycles() {
             .expect("caller STATUS");
         assert_eq!(reply.hdr.ty, MsgType::Status);
         assert!(reply_fd.is_none());
+        // EOF proves every copy of this cycle's write descriptor was closed.
+        // Process-wide FD counts also include concurrently running tests.
+        assert!(
+            fd_pipe_reaches_eof(&read_end, RECV_TIMEOUT),
+            "SCM_RIGHTS relay retained a write descriptor after cycle {seq}"
+        );
     }
-    let after = std::fs::read_dir("/proc/self/fd")
-        .expect("open /proc/self/fd")
-        .count();
-    // The broker runs in-process (thread), so /proc/self/fd also counts its
-    // fds; a truly leaking relay would grow the count ~1 per cycle (32
-    // cycles). A small bounded delta (kernel/allocator scratch, the
-    // one-slot pending_rx_fd) is expected and not a leak. RAII OwnedFd in
-    // the rx slot / tx markers guarantees per-cycle closure; the exact
-    // cross-broker close behavior is pinned by the ubusd_fd_passing suite.
-    assert!(
-        after <= before + 4,
-        "SCM_RIGHTS relay leaked fds across cycles: before={before} after={after}"
-    );
     shutdown(stop, broker);
 }
 

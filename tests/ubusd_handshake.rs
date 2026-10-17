@@ -6487,3 +6487,205 @@ impl Drop for JoinOnDrop {
         }
     }
 }
+
+fn duplicate_protocol_policy_body(path: &str) {
+    let valid_empty = b"\0".as_slice();
+    let missing = b"opus.probe.missing\0".as_slice();
+    let invalid = b"invalid".as_slice();
+    let trailing_garbage = b"\0invalid".as_slice();
+    let cases = [
+        (vec![valid_empty, missing], UBUS_STATUS_NOT_FOUND),
+        (vec![missing, valid_empty], UBUS_STATUS_INVALID_ARGUMENT),
+        (vec![valid_empty, invalid], UBUS_STATUS_INVALID_ARGUMENT),
+        (vec![invalid, missing], UBUS_STATUS_NOT_FOUND),
+        (vec![missing, trailing_garbage], UBUS_STATUS_NOT_FOUND),
+        (
+            vec![trailing_garbage, valid_empty],
+            UBUS_STATUS_INVALID_ARGUMENT,
+        ),
+        (vec![invalid, trailing_garbage], UBUS_STATUS_OK),
+        (
+            vec![valid_empty, missing, valid_empty],
+            UBUS_STATUS_INVALID_ARGUMENT,
+        ),
+    ];
+    let mut transport = UnixUbusTransport::connect(path).expect("connect");
+    for (index, (values, expected)) in cases.into_iter().enumerate() {
+        let seq = 100 + index as u16;
+        let mut env = EnvBuilder::new();
+        for value in values {
+            env.push_bytes_id(UbusAttr::ObjPath as u8, value);
+        }
+        transport
+            .send(&Frame::to_broker(MsgType::Lookup, seq, env.finish()))
+            .expect("send duplicate lookup");
+        let reply = recv_until(&mut transport, Duration::from_secs(5), |frame| {
+            frame.hdr.seq == seq && frame.hdr.ty == MsgType::Status
+        })
+        .expect("duplicate lookup status");
+        assert_eq!(
+            find(&reply.payload, UbusAttr::Status).and_then(|attr| attr.as_u32()),
+            Some(expected as u32),
+            "duplicate case {index}"
+        );
+    }
+    let mut client =
+        UbusClient::connect(UnixUbusTransport::connect(path).expect("connect duplicate client"))
+            .expect("HELLO");
+    let invalid_method = b"invalid".as_slice();
+    for (values, expected) in [
+        (
+            vec![b"bogus\0".as_slice(), b"send\0".as_slice()],
+            UBUS_STATUS_INVALID_ARGUMENT,
+        ),
+        (
+            vec![b"send\0".as_slice(), b"bogus\0".as_slice()],
+            UBUS_STATUS_INVALID_COMMAND,
+        ),
+        (
+            vec![b"send\0".as_slice(), invalid_method],
+            UBUS_STATUS_INVALID_ARGUMENT,
+        ),
+        (
+            vec![invalid_method, b"bogus\0".as_slice()],
+            UBUS_STATUS_INVALID_COMMAND,
+        ),
+    ] {
+        let mut env = EnvBuilder::new();
+        env.push_u32(UbusAttr::ObjId, 1);
+        for value in values {
+            env.push_bytes_id(UbusAttr::Method as u8, value);
+        }
+        env.push_data(&[]);
+        let result = client.request(MsgType::Invoke, 0, env, |_| {
+            panic!("invalid event method must not return DATA")
+        });
+        assert!(matches!(result, Err(UbusError::Status(status)) if status == expected));
+    }
+    for reverse in [false, true] {
+        let object = client.add_anonymous_object().expect("anonymous object");
+        let good = object.to_be_bytes().to_vec();
+        let missing = 0xf000_0001u32.to_be_bytes().to_vec();
+        let (values, expected) = if reverse {
+            (vec![missing, good], UBUS_STATUS_OK)
+        } else {
+            (vec![good, missing], UBUS_STATUS_NOT_FOUND)
+        };
+        let mut env = EnvBuilder::new();
+        for value in values {
+            env.push_bytes_id(UbusAttr::ObjId as u8, &value);
+        }
+        let mut removed = None;
+        let result = client.request(MsgType::RemoveObject, 0, env, |frame| {
+            removed = find(&frame.payload, UbusAttr::ObjId).and_then(|attr| attr.as_u32());
+            Ok(())
+        });
+        if expected == UBUS_STATUS_OK {
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(removed, Some(object));
+        } else {
+            assert!(matches!(result, Err(UbusError::Status(status)) if status == expected));
+            assert_eq!(removed, None);
+        }
+    }
+}
+
+matrix_scenario!(duplicate_protocol_policy, duplicate_protocol_policy_body);
+
+// Malformed ID widths remain literal bytes on direct sockets: the golden
+// normalizer deliberately rejects short IDs instead of rewriting them.
+#[rstest]
+#[case::upstream(BrokerArm::Upstream)]
+#[case::rs(BrokerArm::Rs)]
+fn duplicate_integer_policy_rejects_bad_widths(#[case] arm: BrokerArm) {
+    let start = match arm {
+        BrokerArm::Upstream => UbusdHarness::start_upstream,
+        BrokerArm::Rs => UbusdHarness::start_rust,
+    };
+    let Some(harness) = start().expect("start broker") else {
+        skip::or_skip(
+            "duplicate_integer_policy_rejects_bad_widths",
+            "broker binary not reachable",
+        );
+        return;
+    };
+    let mut client =
+        UbusClient::connect(UnixUbusTransport::connect(harness.socket_path()).unwrap()).unwrap();
+    for invalid in [vec![0], vec![0, 0, 0], vec![0xf0, 0, 0, 1, 0], vec![0; 8]] {
+        for invalid_last in [false, true] {
+            let object = client.add_anonymous_object().unwrap();
+            let good = object.to_be_bytes();
+            let mut env = EnvBuilder::new();
+            for value in if invalid_last {
+                [good.as_slice(), invalid.as_slice()]
+            } else {
+                [invalid.as_slice(), good.as_slice()]
+            } {
+                env.push_bytes_id(UbusAttr::ObjId as u8, value);
+            }
+            let mut removed = None;
+            client
+                .request(MsgType::RemoveObject, 0, env, |frame| {
+                    removed = find(&frame.payload, UbusAttr::ObjId).and_then(|attr| attr.as_u32());
+                    Ok(())
+                })
+                .expect("last valid integer is selected");
+            assert_eq!(removed, Some(object));
+        }
+    }
+}
+
+// These fields are UNSPEC in the pinned C broker policy: arbitrary widths
+// remain eligible and the last NoReply value's first byte controls the ACK.
+fn duplicate_noreply_policy_body(path: &str) {
+    let mut transport = UnixUbusTransport::connect(path).expect("connect");
+    recv_until(&mut transport, Duration::from_secs(5), |frame| {
+        frame.hdr.ty == MsgType::Hello
+    })
+    .expect("HELLO");
+    let object = raw_add_anonymous(&mut transport, 10);
+    let cases: [(&[u8], &[u8], bool); 4] = [
+        (&[1], &[0, 0, 0, 1], true),
+        (&[0, 0, 0, 1], &[1], false),
+        (&[1], &[0, 1], true),
+        (&[0, 0, 0, 1], &[1, 0], false),
+    ];
+    for (index, (first, last, expected_ack)) in cases.into_iter().enumerate() {
+        let seq = 20 + index as u16 * 2;
+        let mut env = EnvBuilder::new();
+        env.push_u32(UbusAttr::ObjId, object);
+        env.push_str(UbusAttr::Method, "probe");
+        env.push_bytes_id(UbusAttr::NoReply as u8, first);
+        env.push_bytes_id(UbusAttr::NoReply as u8, last);
+        transport
+            .send(&Frame::to_peer(MsgType::Notify, seq, object, env.finish()))
+            .expect("duplicate NoReply NOTIFY");
+        // A same-connection PING fences the preceding NOTIFY without sleeps.
+        transport
+            .send(&Frame::to_peer(
+                MsgType::Ping,
+                seq + 1,
+                object,
+                EnvBuilder::new().finish(),
+            ))
+            .expect("PING fence");
+        let acknowledged = std::cell::Cell::new(false);
+        recv_until(&mut transport, Duration::from_secs(5), |frame| {
+            if frame.hdr.seq == seq && frame.hdr.ty == MsgType::Status {
+                assert_eq!(
+                    find(&frame.payload, UbusAttr::Status).and_then(|a| a.as_u32()),
+                    Some(0)
+                );
+                acknowledged.set(true);
+            }
+            frame.hdr.seq == seq + 1 && frame.hdr.ty == MsgType::Status
+        })
+        .expect("PING fence STATUS");
+        assert_eq!(
+            acknowledged.get(),
+            expected_ack,
+            "NoReply duplicate case {index}"
+        );
+    }
+}
+matrix_scenario!(duplicate_noreply_policy, duplicate_noreply_policy_body);

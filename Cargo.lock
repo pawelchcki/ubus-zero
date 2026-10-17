@@ -310,6 +310,7 @@ dependencies = [
 name = "ubus-testkit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libubox-sys",
  "paste",
  "rustix",

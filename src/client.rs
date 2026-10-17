@@ -97,7 +97,8 @@ impl<T: Transport> UbusClient<T> {
 
     /// Perform a broker request, delivering every DATA reply to the callback.
     /// Asynchronous messages arriving during the request are retained for
-    /// [`Self::recv_frame`]. Transports supply the real-time deadline.
+    /// [`Self::recv_frame`]. Accepted DATA resets the idle-wait budget; unrelated
+    /// traffic does not. Transports supply the real-time deadline.
     pub fn request(
         &mut self,
         ty: MsgType,
@@ -121,6 +122,7 @@ impl<T: Transport> UbusClient<T> {
             if frame.hdr.seq == seq && matches!(frame.hdr.ty, MsgType::Status | MsgType::Data) {
                 if frame.hdr.ty == MsgType::Data {
                     on_data(&frame)?;
+                    idle_waits = 0;
                 } else {
                     let status = crate::envelope::read_status(&frame.payload)?;
                     return if status == 0 {
@@ -462,6 +464,67 @@ mod tests {
             Some(2)
         );
         assert_eq!(client.recv_frame().unwrap(), Some(event));
+    }
+
+    /// One idle read between each complete frame models a slowly delivered
+    /// multi-DATA response without depending on kernel scheduling.
+    struct IntermittentReplies {
+        frames: VecDeque<Frame>,
+        idle: bool,
+    }
+
+    impl Transport for IntermittentReplies {
+        fn send(&mut self, _: &Frame) -> Result<(), UbusError> {
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Result<Option<Frame>, UbusError> {
+            self.idle = !self.idle;
+            Ok(if self.idle {
+                None
+            } else {
+                self.frames.pop_front()
+            })
+        }
+    }
+
+    fn intermittent_data(seq: u16) -> IntermittentReplies {
+        IntermittentReplies {
+            frames: (0..=IDLE_WAIT_BUDGET)
+                .map(|_| Frame::to_peer(MsgType::Data, seq, 0, EnvBuilder::new().finish()))
+                .collect(),
+            idle: false,
+        }
+    }
+
+    #[test]
+    fn request_idle_budget_resets_when_response_data_makes_progress() {
+        let mut transport = intermittent_data(1);
+        let mut status = EnvBuilder::new();
+        status.push_i32(UbusAttr::Status, 0);
+        transport
+            .frames
+            .push_back(Frame::to_peer(MsgType::Status, 1, 0, status.finish()));
+        let mut client = UbusClient::without_hello(transport);
+        let mut received = 0;
+        client
+            .request(MsgType::Lookup, 0, EnvBuilder::new(), |_| {
+                received += 1;
+                Ok(())
+            })
+            .expect("a progressing response must finish despite many inter-frame waits");
+        assert_eq!(received, IDLE_WAIT_BUDGET + 1);
+    }
+
+    #[test]
+    fn request_still_times_out_on_silence_or_unrelated_data() {
+        for seq in [1, 99] {
+            let mut client = UbusClient::without_hello(intermittent_data(seq));
+            assert!(matches!(
+                client.request(MsgType::Lookup, 0, EnvBuilder::new(), |_| Ok(())),
+                Err(UbusError::Timeout("request"))
+            ));
+        }
     }
 
     #[test]

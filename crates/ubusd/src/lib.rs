@@ -9,6 +9,8 @@ pub mod acl;
 pub mod broker;
 mod net;
 pub mod peer;
+#[cfg(target_os = "linux")]
+mod poller;
 pub mod registry;
 pub mod reply;
 pub mod routing;

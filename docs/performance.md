@@ -1,121 +1,166 @@
 # Broker performance comparisons
 
-The benchmark runs identical, verified protocol operations against the pinned
-OpenWrt C `ubusd` and the Rust broker. It measures end-to-end latency and
-throughput over local Unix sockets. It does not measure isolated broker CPU
-time, memory use, or OpenWrt router hardware.
+The benchmark runs identical, verified operations against pinned OpenWrt C
+`ubusd` and the Rust broker over local Unix sockets. It reports end-to-end
+latency/throughput, broker process CPU time, and broker resident memory. Results
+characterize the measured host and workloads; they are not language-level speed
+claims or measurements of router hardware.
 
 ## Run
 
-On Linux, with Python 3.12+, the pinned Rust toolchain, a C compiler, and Docker Buildx:
+On Linux, with Python 3.12+, the pinned Rust toolchain, a C compiler and Docker Buildx:
 
 ```sh
 tools/ubusd-builder/build.sh
 python3 tools/ubus-benchmark.py
 ```
 
-The runner builds both Rust executables in release mode and obtains their
-actual paths from Cargo's JSON output. It honors `CARGO_TARGET_DIR` and never
-falls back to an existing debug binary. The default C reference comes from
-`.dep/bin/ubusd`; a missing or unusable broker is a failure, not a skip.
-
-Open `dist/benchmarks/report.html` for the comparison. The directory also
-contains `performance.json` (all raw latency samples and provenance),
-`summary.csv`, and `report.md`. The HTML is self-contained and needs no
-external scripts, fonts or services.
+Reports under `dist/benchmarks/` are `report.html` (standalone, no external assets),
+`performance.json` (raw latency samples, CPU/memory counters and provenance),
+`summary.csv` and `report.md`.
 
 ```sh
-python3 tools/ubus-benchmark.py --iterations 5000 --samples 6 --warmup 250
-python3 tools/ubus-benchmark.py --smoke    # harness validation, not a performance result
-python3 tools/ubus-benchmark.py --baseline-ref origin/main  # C, baseline Rust, current Rust
+python3 tools/ubus-benchmark.py --smoke
+python3 tools/ubus-benchmark.py --baseline-ref origin/main
+python3 tools/ubus-benchmark.py --profile-matrix --workload ping --workload echo
+python3 tools/ubus-benchmark.py --samples 12 --pipeline-iterations 200000
+cargo run --release -p ubusd --example footprint
 ```
 
-`--iterations` counts operations **per client per sample**. `--upstream`
-selects another reference executable; `--output` selects the report directory.
+`--iterations` counts operations per client per sample (default 5,000).
+Pipelined trials use `--pipeline-iterations` (200,000), and the 1,000-object
+list uses `--scaling-iterations` (200). Prefix, ACL and fanout trials use the
+ordinary 5,000 iterations. Each report row records its actual count. `--samples`
+defaults to six and `--warmup` to 100. Repeat
+`--workload` to select a subset. `--upstream` selects an exact reference binary;
+`--output` selects the report directory. Missing fixtures or failed builds fail
+rather than skip or fall back to debug executables.
 
-`--baseline-ref` archives the resolved Git commit into a temporary directory
-and builds its broker before measuring. All three arms use the current Rust
-driver, toolchain and pinned C fixtures; sample order rotates among them.
-The report records the baseline commit, build profile and binary hash.
-The temporary checkout and binary are removed after the run. Fetch the desired
-ref first. A missing ref or failed baseline build is a failure, not a skip.
+`--smoke` uses 20 operations/client, two trials and five warmups for every case.
+Its report is marked as harness validation, not a performance result.
 
-## Workloads
+`--baseline-ref` archives and builds that resolved Git commit before measuring.
+The baseline uses its own manifest/lockfile, the current toolchain and the same
+pinned fixtures. All arms use the same current driver. Fetch the ref first.
+The report records baseline revision, build settings, executable hash and size.
+Temporary baseline sources and executables are removed after reporting.
 
-| Operation | Clients | Verification |
-| --- | ---: | --- |
-| Connect, HELLO, close | 1 | Valid nonzero broker-assigned identity |
-| Ping on a persistent connection | 1 | Successful ubus reply |
-| Pipelined ping, up to 32 outstanding requests | 1 | Exact DATA then STATUS(0), with matching sequence and address for every request |
-| Lookup of a registered object | 1 | Exact registered object ID |
-| Echo, 64 / 4,096 / 32,768-byte string | 1 | Exact returned blobmsg bytes, including client ID and per-request sequence |
-| Echo, 4,096-byte string | 4 | Independent identities and sequences; every reply verified |
+The production broker uses `opt-level=3` for the `ubusd` package; the public
+`no_std` library keeps the workspace's size-oriented `opt-level=z`. Other release
+settings, including fat LTO, remain shared. The private driver
+uses the separate `bench-driver` profile (`opt-level=3`), so size-oriented client
+code does not unnecessarily limit broker comparisons. Persistent client/provider
+endpoints reserve 64 KiB read buffers outside timing; connect uses 2 KiB reads.
+Send backpressure waits for writable readiness instead of fixed sleeps.
+Cargo's executable paths and actual artifact profiles are read from its JSON
+output; `CARGO_TARGET_DIR` is honored.
 
-Payload sizes describe the string contents, excluding blobmsg and protocol
-overhead. Echo and lookup use the same Rust object provider on both brokers.
-The provider waits for socket readiness between requests; there is no fixed
-sleep added to each reply. The concurrent workload has one provider serving
-four clients, so its scheduling can also limit throughput.
+`--profile-matrix` additionally builds Rust brokers at `opt-level=z`, `s`, `2`
+and `3`, changing only the `ubusd` package override. Dependency profiles and
+the driver stay fixed; differing dependency profiles fail the run. Every arm's
+actual Cargo profiles (including dependencies), SHA-256 and executable size are
+recorded. Compilation finishes before host load/provenance capture and before trials. Temporary matrix
+binaries are removed after reporting. Choose enough trials to balance starting
+positions: multiples of the number of arms (two normally, three with a baseline,
+six with the matrix, seven with both).
 
-Each sample gets a fresh broker. Registration, connection setup and warm-up
-finish before measurement. Connect is the exception: opening the socket,
-validating HELLO and closing the connection are the operation being measured.
-Each client issues one request at a time, except pipelined ping, which keeps
-up to 32 requests outstanding. Its per-request latency starts at send and ends
-after both replies are validated, including time queued behind earlier
-requests. Warm-up requests drain before measurement. These are closed-loop
-workloads, not latency under an independently fixed arrival rate.
-Pipelined setup also completes an untimed ping to drain the normal client's
-redundant HELLO status before reading replies directly from its transport.
+## Workloads and verification
 
-The broker shares one receive scratch buffer across peers. It starts at 4 KiB
-and grows for declared frame bodies up to 64 KiB, retained for later reads.
-This trades at most 64 KiB of broker heap for fewer receive syscalls on large
-messages while preserving descriptor-free batching and header-only FD capture.
+| Workload | Setup | Verification per operation |
+| --- | --- | --- |
+| Connect | Fresh connection | Nonzero HELLO identity, close |
+| Ping | Persistent connection | Successful reply |
+| Pipelined ping | Up to 32 outstanding | Exact DATA then STATUS(0), sequence and address on every request |
+| Lookup | One registered object | Exact object ID |
+| Echo | 64 / 4,096 / 32,768-byte string; one client, plus four-client 4,096-byte case | Exact returned blobmsg including client and request sequence |
+| Registry list | 1,000 typed objects | Every ID, path and signature in exact order |
+| Prefix lookup | 100 matches among 1,000 objects | Exact ordered matching objects/signatures |
+| Non-root ACL lookup | 100 objects and 100 access rules | Exact visible objects and signatures |
+| Registration churn | Repeated named register/remove | Assigned identity and exact removal response |
+| Ping with idle peers | 200 other connected clients | Successful ping |
+| Event fanout | 50 listeners | Every destination, method, payload and per-listener sequence progression |
+| NOTIFY fanout | 50 subscribers, NoReply enabled | Every destination, publisher address, sequence, method, payload and NoReply flag |
+
+Payload sizes count string contents, excluding protocol overhead. Echo/lookup
+use the same Rust provider for all arms. The single provider and client-side
+validation can limit end-to-end throughput; broker CPU counters help expose
+changes hidden by that shared work. Fanout operations include draining and
+verifying all 50 deliveries; they count as one operation, not 50 operations.
+
+Each trial starts a fresh broker. Registration, connections and warmup finish
+before timing. Streaming DATA resets the client idle budget, while silent or
+unrelated traffic still times out. Connect includes its own handshake and close. Pipeline warmup
+fully drains before timing; an untimed ping first drains the normal client's
+redundant HELLO status before direct transport reads. Per-request pipeline
+latency runs from send through both validated replies, including queueing.
+These are closed-loop workloads, not fixed-arrival-rate latency tests.
+
+Both brokers get the same child-local credential shim. Only the ACL workload
+uses non-root credentials plus the compatibility suite's stat/NSS fixtures;
+other workloads use the root fast path. Wire taps, injected faults and ambient
+preload/test-identity overrides are excluded from measurement.
 
 ## Interpret the report
 
-- p50, p95 and p99 are nearest-rank percentiles over all measured operations
-  for that workload and broker. Warm-up operations are excluded.
-- Throughput is the median of the repeated samples' operation rates. Each
-  rate divides **total completed operations by concurrent wall time**;
-  summing individual client latencies would understate concurrent throughput.
-  Wall time includes the start barrier, thread joins and connection cleanup.
-- Latency includes client serialization, transport, broker routing, provider
-  execution, reply parsing and validation. It is not broker processing time.
-- Broker order rotates across samples and workloads. All arms use direct
-  sockets and the compatibility harness's same child-local root-credential
-  shim. This permits named registration without host ACL changes; it does
-  not benchmark ACL evaluation. Wire taps and I/O faults are excluded.
-  Ambient fault, preload and test-identity overrides cause a hard failure.
-- The reference builder uses CMake Release. Rust uses this repository's
-  release profile, including `opt-level = "z"` and LTO. These are the existing
-  build settings, not identical compiler optimization policies.
+- Throughput is the median of trial rates: total completed operations divided
+  by concurrent wall time, including barrier, joins and connection cleanup.
+- p50/p95/p99 use nearest-rank percentiles across measured operations. Warmup
+  is excluded. End-to-end times include serialization, IPC, provider execution,
+  parsing and validation.
+- Broker CPU uses Linux's process CPU clock (user plus system time) over the
+  measured window, divided by operations. It excludes client/provider CPU.
+  This is not hardware instructions or cycles, and includes any broker cleanup
+  occurring in that window.
+- RSS is sampled after the operations while the broker is alive. Peak RSS is
+  its **lifetime** high-water mark, including registration and warmup, not an
+  isolated timed-window peak. Memory counters are bytes in JSON and KiB in tables.
+- Throughput ratios to C include deterministic paired-trial percentile bootstrap
+  intervals (2,000 resamples, 95%). An interval is absent with fewer than two
+  trials. With few trials these estimates are coarse; they do not establish
+  portable significance or account for every shared-host effect. Overlapping
+  observed ranges alone do not prove that an effect is noise.
+- Trials below 100 ms are counted in `short_samples`. Use longer trials and
+  more repetitions before drawing conclusions from small deltas.
+- Arm order rotates across trials/workloads. CPU model, available affinity,
+  kernel, starting load, compiler, profiles, source/dirty state, executable and
+  shared-library hashes/sizes, and pinned recipe revisions are recorded.
+  Binaries/libraries are rehashed afterward to reject changes during a run.
 
-The JSON records the source commit and dirty state, Rust compiler, build
-profiles, executable and reference-library SHA-256s, reference recipe pins,
-CPU, affinity, kernel and starting system load. Recipe pins describe the
-checked-in builder; a user-supplied reference binary is identified by its
-hash, not independently authenticated as that revision.
+The Linux broker uses level-triggered epoll keyed by monotonic peer IDs, with
+write readiness armed only while bytes are queued. Other platforms use poll;
+a native test also checks that fallback. Descriptor-free consecutive replies
+can share a send; monitor traffic preserves individual frame boundaries. The
+receive shortcut drains to EOF on HUP and retains header/body FD boundaries.
 
-Run on a quiet host and keep machine, power settings, affinity, reference
-binaries, toolchain and build profiles fixed when comparing changes. Shared
-CI hosts are useful for checking the harness, but their timings are not a
-portable performance claim. CPU scheduling and client/provider overhead can
-hide broker differences; repeat surprising results before optimizing.
+The C fixture uses CMake Release; Rust's exact settings are reported. These are
+not guaranteed identical optimization policies. User-supplied C binaries are
+identified by hash; the checked-in recipe pins do not authenticate their origin.
+Run on a quiet machine and keep CPU placement, affinity, power settings, fixtures,
+toolchain and settings fixed. Use separate, untimed profiler runs for allocation
+tracing, syscall counts or `perf` hardware counters; profiler timings should not
+be mixed into ordinary results.
+
+## Allocation and retained-memory diagnostic
+
+The `footprint` example installs a tracking allocator, warms up and verifies
+10,000 ping and invoke-forward dispatches, and reports allocation/reallocation
+calls. It also repeatedly registers/removes a named object and reports live
+allocated bytes after 1,000, 2,000 and 4,000 cycles, with no live objects.
+Dropping that registry should release its measured retained bytes.
+
+This diagnostic covers Rust routing only: socket I/O, codec and broker-loop
+allocations are excluded. It is not a timing benchmark or a C comparison.
+Run the same example against the desired baseline to compare source changes.
+The instrumentation itself adds overhead and belongs outside timing runs.
 
 ## CI
 
-The **Broker performance** workflow validates all workloads in a short PR
-smoke run. Main-branch changes, weekly runs and manual dispatches use the full
-defaults: 5,000 operations per client, six samples and 100 warm-up operations.
-Longer trials reduce the influence of thread and scheduler overhead. Six samples
-balance starting positions for both two-arm and three-arm comparisons.
-The job uploads the HTML, CSV, Markdown and raw JSON as `broker-performance`
-and adds its table to the Actions summary.
-Manual dispatch accepts an optional `baseline_ref` for a same-machine comparison
-of C, baseline Rust and current Rust.
+The **Broker performance** workflow verifies every workload in a short PR smoke
+run. Main changes, weekly runs and manual dispatches use full defaults. Manual
+inputs can select a baseline ref and enable the compiler-profile matrix. Reports
+and raw samples are uploaded as `broker-performance`; the table also appears in
+the Actions summary.
 
-Wrong replies, missing fixtures and broken runs fail CI. Latency and
-throughput have no pass/fail thresholds. The existing strict compatibility
-and fault-profile gates continue to establish protocol correctness.
+Wrong replies, missing fixtures, invalid CPU/memory counters and broken runs fail
+CI. Timing has no pass/fail thresholds. Strict compatibility and fault-profile
+checks independently establish protocol correctness.

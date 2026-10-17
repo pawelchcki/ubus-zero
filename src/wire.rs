@@ -200,6 +200,31 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+/// Borrowed frame view for dispatch without copying the inbound payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameRef<'a> {
+    pub hdr: Header,
+    pub payload: &'a [u8],
+}
+
+impl FrameRef<'_> {
+    pub fn to_owned(self) -> Frame {
+        Frame {
+            hdr: self.hdr,
+            payload: self.payload.to_vec(),
+        }
+    }
+}
+
+impl<'a> From<&'a Frame> for FrameRef<'a> {
+    fn from(frame: &'a Frame) -> Self {
+        Self {
+            hdr: frame.hdr,
+            payload: &frame.payload,
+        }
+    }
+}
+
 impl Frame {
     /// `peer=0` is the wire convention for "destination = ubusd". Sending
     /// peer=local_id makes ubusd treat the message as targeted at us and
@@ -236,9 +261,15 @@ pub struct Codec;
 impl Codec {
     pub fn write_frame(frame: &Frame) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_SIZE + frame.payload.len());
+        Self::write_frame_into(frame, &mut out);
+        out
+    }
+
+    /// Encode into reusable storage, retaining its capacity between sends.
+    pub fn write_frame_into(frame: &Frame, out: &mut Vec<u8>) {
+        out.clear();
         out.extend_from_slice(&frame.hdr.encode());
         out.extend_from_slice(&frame.payload);
-        out
     }
 
     /// Header-only frames (e.g. broker -> client HELLO) decode only
@@ -250,7 +281,7 @@ impl Codec {
     /// pre-queue multiple frames must use the libubus-shape HELLO
     /// (header + 4-byte empty envelope) to give the codec a length.
     pub fn read_frame(buf: &[u8]) -> Result<(Frame, usize), UbusError> {
-        Self::read_frame_with(buf, Header::decode)
+        Self::read_frame_with(buf, Header::decode).map(|(frame, size)| (frame.to_owned(), size))
     }
 
     /// Broker-side frame decode compatible with upstream `ubusd`:
@@ -258,13 +289,20 @@ impl Codec {
     /// returned [`Frame`]. Client-side transports intentionally keep
     /// using [`read_frame`](Self::read_frame), which remains strict.
     pub fn read_frame_lenient_version(buf: &[u8]) -> Result<(Frame, usize), UbusError> {
+        Self::read_frame_borrowed_lenient_version(buf).map(|(frame, size)| (frame.to_owned(), size))
+    }
+
+    /// Broker-side decoding that borrows the payload until dispatch completes.
+    pub fn read_frame_borrowed_lenient_version(
+        buf: &[u8],
+    ) -> Result<(FrameRef<'_>, usize), UbusError> {
         Self::read_frame_with(buf, Header::decode_lenient_version)
     }
 
     fn read_frame_with(
         buf: &[u8],
         decode_header: fn(&[u8]) -> Result<Header, UbusError>,
-    ) -> Result<(Frame, usize), UbusError> {
+    ) -> Result<(FrameRef<'_>, usize), UbusError> {
         if buf.len() < HEADER_SIZE {
             return Err(UbusError::Short {
                 need: HEADER_SIZE,
@@ -323,8 +361,8 @@ impl Codec {
                 have: buf.len(),
             });
         }
-        let payload = buf[body_start..payload_end].to_vec();
-        Ok((Frame { hdr, payload }, consumed))
+        let payload = &buf[body_start..payload_end];
+        Ok((FrameRef { hdr, payload }, consumed))
     }
 }
 
@@ -332,6 +370,31 @@ impl Codec {
 mod tests {
     use super::*;
     use crate::envelope::EnvBuilder;
+
+    #[test]
+    fn borrowed_decode_preserves_boundary_without_copying_payload() {
+        let mut env = EnvBuilder::new();
+        env.push_u32(crate::envelope::UbusAttr::ObjId, 17);
+        let frame = Frame::to_broker(MsgType::Lookup, 9, env.finish());
+        let bytes = Codec::write_frame(&frame);
+        let mut pipeline = bytes.clone();
+        pipeline.extend_from_slice(&bytes);
+        let (borrowed, consumed) = Codec::read_frame_borrowed_lenient_version(&pipeline).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(borrowed.to_owned(), frame);
+        assert_eq!(borrowed.payload.as_ptr(), pipeline[HEADER_SIZE..].as_ptr());
+        for cut in HEADER_SIZE + 1..bytes.len() {
+            assert!(matches!(
+                Codec::read_frame_borrowed_lenient_version(&bytes[..cut]),
+                Err(UbusError::Short { .. })
+            ));
+        }
+        let mut reused = alloc::vec![0xff; 128];
+        let capacity = reused.capacity();
+        Codec::write_frame_into(&frame, &mut reused);
+        assert_eq!(reused, bytes);
+        assert_eq!(reused.capacity(), capacity);
+    }
 
     #[test]
     fn header_roundtrip() {

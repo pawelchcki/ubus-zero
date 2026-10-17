@@ -38,6 +38,26 @@ impl UbusdHarness {
         .ok_or_else(|| io::Error::other("explicit broker executable is not viable"))
     }
 
+    /// Exact-binary benchmark variant with child-local ACL/stat/NSS fixtures.
+    pub fn start_binary_with_acl(
+        binary: &std::path::Path,
+        socket_flag: &str,
+        acl_dir: &str,
+        extra_env: &[(&str, &str)],
+    ) -> io::Result<Self> {
+        let mut env = vec![("UBUS_TESTKIT_STAT_ROOT_PREFIX", acl_dir)];
+        env.extend_from_slice(extra_env);
+        Self::spawn(
+            binary.as_os_str(),
+            &[socket_flag],
+            &["-A", acl_dir],
+            &with_nss_shim(acl_shims(), &env),
+            &env,
+            None,
+        )?
+        .ok_or_else(|| io::Error::other("explicit ACL broker executable is not viable"))
+    }
+
     /// Try to spawn upstream `ubusd -s <unique-path>`. `Ok(None)` when
     /// no binary is found; every other failure is `Err`. Probes the
     /// socket for up to ~5 s before returning.

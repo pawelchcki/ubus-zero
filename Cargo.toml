@@ -69,5 +69,14 @@ codegen-units = 1
 strip = true
 opt-level = "z"
 
+# Keep the no_std library size-oriented; optimize the host daemon's routing/index code.
+[profile.release.package.ubusd]
+opt-level = 3
+
 [profile.dev]
 panic = "abort"
+
+# Host benchmark driver is optimized independently of shipped library/broker profiles.
+[profile.bench-driver]
+inherits = "release"
+opt-level = 3

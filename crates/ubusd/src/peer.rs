@@ -8,6 +8,7 @@
 //! buffer drains.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use rustix::fd::OwnedFd;
 use ubus::wire::MAX_MSG_LEN;
@@ -37,10 +38,11 @@ pub struct Peer {
     /// pure routing tests use.
     pub(crate) fd: Option<OwnedFd>,
 
-    /// SO_PEERCRED uid of the accepted socket.
-    pub(crate) uid: Option<u32>,
-    pub(crate) gid: Option<u32>,
-    pub(crate) extra_gids: Vec<u32>,
+    /// Immutable accepted credentials, shared by dispatch without per-frame
+    /// string/group allocation. Only test setup mutates through Arc::make_mut.
+    pub(crate) credentials: Arc<Cred>,
+    #[cfg(target_os = "linux")]
+    pub(crate) write_interest: bool,
 
     pub(crate) rx_buf: Vec<u8>,
     pub(crate) tx_buf: VecDeque<u8>,
@@ -58,13 +60,6 @@ pub struct Peer {
     /// Running byte counters used to keep `tx_fds` valid across buffer drains.
     pub(crate) tx_enq_abs: usize,
     pub(crate) tx_sent_abs: usize,
-
-    /// SO_PEERCRED-resolved username, when libc name service can
-    /// resolve the accepted socket's uid.
-    pub(crate) user: Option<String>,
-    /// SO_PEERCRED-resolved group name, when libc name service can
-    /// resolve the accepted socket's gid.
-    pub(crate) group: Option<String>,
 
     /// obj-ids this peer registered. Reaped wholesale on disconnect.
     pub(crate) owned: Vec<ObjectId>,
@@ -87,11 +82,23 @@ pub struct Peer {
 
 impl Peer {
     pub fn new(fd: OwnedFd, uid: Option<u32>, user: Option<String>, group: Option<String>) -> Self {
+        Self::with_credentials(
+            fd,
+            Cred {
+                uid,
+                user,
+                group,
+                ..Cred::default()
+            },
+        )
+    }
+
+    pub(crate) fn with_credentials(fd: OwnedFd, credentials: Cred) -> Self {
         Self {
             fd: Some(fd),
-            uid,
-            gid: None,
-            extra_gids: Vec::new(),
+            credentials: Arc::new(credentials),
+            #[cfg(target_os = "linux")]
+            write_interest: false,
             rx_buf: Vec::with_capacity(2048),
             tx_buf: VecDeque::with_capacity(2048),
             rx_fds: VecDeque::new(),
@@ -99,8 +106,6 @@ impl Peer {
             tx_fds: VecDeque::new(),
             tx_enq_abs: 0,
             tx_sent_abs: 0,
-            user,
-            group,
             owned: Vec::new(),
             subs: Vec::new(),
             next_notify_seq: 1,
@@ -114,9 +119,9 @@ impl Peer {
     pub fn stub() -> Self {
         Self {
             fd: None,
-            uid: None,
-            gid: None,
-            extra_gids: Vec::new(),
+            credentials: Arc::new(Cred::default()),
+            #[cfg(target_os = "linux")]
+            write_interest: false,
             rx_buf: Vec::new(),
             tx_buf: VecDeque::new(),
             rx_fds: VecDeque::new(),
@@ -124,8 +129,6 @@ impl Peer {
             tx_fds: VecDeque::new(),
             tx_enq_abs: 0,
             tx_sent_abs: 0,
-            user: None,
-            group: None,
             owned: Vec::new(),
             subs: Vec::new(),
             next_notify_seq: 1,
@@ -137,18 +140,12 @@ impl Peer {
     #[cfg(test)]
     pub fn stub_with_uid(uid: u32) -> Self {
         let mut peer = Self::stub();
-        peer.uid = Some(uid);
+        Arc::make_mut(&mut peer.credentials).uid = Some(uid);
         peer
     }
 
-    pub(crate) fn cred(&self) -> Cred {
-        Cred {
-            uid: self.uid,
-            gid: self.gid,
-            extra_gids: self.extra_gids.clone(),
-            user: self.user.clone(),
-            group: self.group.clone(),
-        }
+    pub(crate) fn cred(&self) -> Arc<Cred> {
+        Arc::clone(&self.credentials)
     }
 
     pub fn enqueue(&mut self, bytes: &[u8]) {

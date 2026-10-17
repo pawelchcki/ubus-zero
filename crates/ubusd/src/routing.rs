@@ -23,7 +23,7 @@ use rustix::fd::OwnedFd;
 use ubus::blobmsg::{lookup as blobmsg_lookup, BlobBuilder, BlobMsgTable};
 use ubus::envelope::{find, UbusAttr};
 use ubus::wire::{
-    Codec, Frame, MsgType, UBUS_STATUS_INVALID_ARGUMENT, UBUS_STATUS_INVALID_COMMAND,
+    Codec, Frame, FrameRef, MsgType, UBUS_STATUS_INVALID_ARGUMENT, UBUS_STATUS_INVALID_COMMAND,
     UBUS_STATUS_METHOD_NOT_FOUND, UBUS_STATUS_NOT_FOUND, UBUS_STATUS_PERMISSION_DENIED,
     UBUS_SYSTEM_OBJECT_ACL, UBUS_SYSTEM_OBJECT_MONITOR,
 };
@@ -93,6 +93,33 @@ pub fn dispatch(
     monitors: &mut MonitorRegistry,
     frame_fd: &mut Option<OwnedFd>,
 ) -> Vec<Action> {
+    dispatch_ref(
+        &FrameRef::from(frame),
+        src_peer,
+        acl,
+        acl_sequence,
+        peers,
+        objects,
+        subs,
+        events,
+        monitors,
+        frame_fd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_ref(
+    frame: &FrameRef<'_>,
+    src_peer: PeerId,
+    acl: &AclRegistry,
+    acl_sequence: u32,
+    peers: &mut PeerTable,
+    objects: &mut ObjectRegistry,
+    subs: &mut SubscriberRegistry,
+    events: &mut EventRegistry,
+    monitors: &mut MonitorRegistry,
+    frame_fd: &mut Option<OwnedFd>,
+) -> Vec<Action> {
     let cred = peers
         .get(src_peer)
         .map(crate::peer::Peer::cred)
@@ -133,7 +160,7 @@ pub fn dispatch(
     }
 }
 
-fn dispatch_hello(frame: &Frame, src_peer: PeerId) -> Vec<Action> {
+fn dispatch_hello(frame: &FrameRef<'_>, src_peer: PeerId) -> Vec<Action> {
     // The unsolicited HELLO is pushed by `accept_pending`; any HELLO
     // arriving via `dispatch` is a redundant client greeting on an
     // already-handshaked connection. Upstream `ubusd` replies with
@@ -146,7 +173,7 @@ fn dispatch_hello(frame: &Frame, src_peer: PeerId) -> Vec<Action> {
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_add_object(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
@@ -155,13 +182,12 @@ fn dispatch_add_object(
     subs: &mut SubscriberRegistry,
     events: &mut EventRegistry,
 ) -> Vec<Action> {
-    let signature = find(&frame.payload, UbusAttr::Signature)
+    let signature = find(frame.payload, UbusAttr::Signature)
         .and_then(|attr| object_signature(attr.as_blobmsg()));
     // Named objects broadcast `ubus.object.add` once registered; capture
     // the path so we can mint that event after the owner's reply.
     let mut named_path: Option<String> = None;
-    let (obj_id, replaced) = match find(&frame.payload, UbusAttr::ObjPath).and_then(|a| a.as_str())
-    {
+    let (obj_id, replaced) = match find(frame.payload, UbusAttr::ObjPath).and_then(|a| a.as_str()) {
         Some(path) => {
             if !acl.check(cred, path, AclOp::Publish, None) {
                 return status_action(frame, src_peer, UBUS_STATUS_INVALID_ARGUMENT);
@@ -238,14 +264,14 @@ fn dispatch_add_object(
 }
 
 fn dispatch_remove_object(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     peers: &mut PeerTable,
     objects: &mut ObjectRegistry,
     subs: &mut SubscriberRegistry,
     events: &mut EventRegistry,
 ) -> Vec<Action> {
-    let obj_id = match find(&frame.payload, UbusAttr::ObjId)
+    let obj_id = match find(frame.payload, UbusAttr::ObjId)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
     {
@@ -327,7 +353,7 @@ fn dispatch_remove_object(
 /// seq/peer via [`reply`].
 fn add_or_remove_reply(
     dest: PeerId,
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     obj_id: ObjectId,
     obj_type: Option<ObjectId>,
 ) -> Vec<Action> {
@@ -384,7 +410,7 @@ fn object_signature(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn dispatch_lookup(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
@@ -401,12 +427,12 @@ fn dispatch_lookup(
     // and any embedded `*` are matched literally (probed live:
     // `example.[ag]*` returns NOT_FOUND even with `example.alpha`
     // registered). Everything else is an exact-path lookup.
-    let path_attr = lookup_obj_path(&frame.payload);
+    let path_attr = lookup_obj_path(frame.payload);
     if path_attr == Some("") {
         return status_action(frame, src_peer, UBUS_STATUS_INVALID_ARGUMENT);
     }
     let mut out: Vec<Action> = Vec::new();
-    let matches: Vec<(ObjectId, String)> = match path_attr {
+    let matches: Vec<(ObjectId, &str)> = match path_attr {
         Some(p) if !p.is_empty() => match p.strip_suffix('*') {
             Some(prefix) => {
                 // NOT_FOUND fires only when nothing carries the prefix.
@@ -415,13 +441,13 @@ fn dispatch_lookup(
                 if !objects.any_path_with_prefix(prefix) {
                     return status_action(frame, src_peer, UBUS_STATUS_NOT_FOUND);
                 }
-                sorted_typed_paths(objects)
-                    .into_iter()
-                    .filter(|(_, path)| path.starts_with(prefix))
+                objects
+                    .iter_typed_prefix(prefix)
+                    .map(|(id, path, _)| (id, path))
                     .collect()
             }
             None => match objects.lookup_exact(p) {
-                Some(id) if objects.type_of(id).is_some() => vec![(id, p.to_string())],
+                Some(id) if objects.type_of(id).is_some() => vec![(id, p)],
                 Some(_) => Vec::new(),
                 None => return status_action(frame, src_peer, UBUS_STATUS_NOT_FOUND),
             },
@@ -437,7 +463,7 @@ fn dispatch_lookup(
         let signature = if cred.uid == Some(0) {
             signature
         } else {
-            let grants = acl.matching_access_grants(cred, &path);
+            let grants = acl.matching_access_grants(cred, path);
             let mut remaining = signature;
             let mut allowed = Vec::new();
             let mut declared = 0;
@@ -466,7 +492,7 @@ fn dispatch_lookup(
                 frame.hdr.seq,
                 frame.hdr.peer,
                 id,
-                &path,
+                path,
                 obj_type,
                 signature,
             ),
@@ -488,18 +514,16 @@ fn lookup_obj_path(payload: &[u8]) -> Option<&str> {
         .and_then(|attr| attr.as_str())
 }
 
-fn sorted_typed_paths(objects: &ObjectRegistry) -> Vec<(ObjectId, String)> {
-    let mut all: Vec<(ObjectId, String)> = objects
+fn sorted_typed_paths(objects: &ObjectRegistry) -> Vec<(ObjectId, &str)> {
+    objects
         .iter_typed_paths()
-        .map(|(id, path, _)| (id, path.to_string()))
-        .collect();
-    all.sort_by(|a, b| a.1.cmp(&b.1));
-    all
+        .map(|(id, path, _)| (id, path))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_invoke(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
@@ -510,8 +534,8 @@ fn dispatch_invoke(
     monitors: &mut MonitorRegistry,
     frame_fd: &mut Option<OwnedFd>,
 ) -> Vec<Action> {
-    let method = find(&frame.payload, UbusAttr::Method).and_then(|a| a.as_str());
-    let obj_id = find(&frame.payload, UbusAttr::ObjId)
+    let method = find(frame.payload, UbusAttr::Method).and_then(|a| a.as_str());
+    let obj_id = find(frame.payload, UbusAttr::ObjId)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new);
     let (Some(method), Some(obj_id)) = (method, obj_id) else {
@@ -544,7 +568,7 @@ fn dispatch_invoke(
             let (user, group) = peer_names(peers, src_peer);
             vec![Action::SendTo {
                 peer_id: owner,
-                frame: reply::stamped_forwarded_invoke(frame, src_peer, obj_id, user, group),
+                frame: reply::stamped_forwarded_invoke_ref(frame, src_peer, obj_id, user, group),
                 fd: frame_fd.take(),
             }]
         }
@@ -556,7 +580,7 @@ fn dispatch_invoke(
 /// ladder in upstream's `ubusd_reply_query` is unreachable here: INVOKE has
 /// already required and resolved METHOD + OBJID before entering this branch.
 fn dispatch_acl_builtin(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     method: &str,
     objects: &ObjectRegistry,
@@ -610,15 +634,15 @@ fn dispatch_acl_builtin(
 /// INVOKE against upstream's monitor system object (`ObjId == 3`). The uid
 /// gate intentionally precedes method lookup, including unknown methods.
 fn dispatch_monitor_builtin(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     peers: &PeerTable,
     monitors: &mut MonitorRegistry,
 ) -> Vec<Action> {
-    if peers.get(src_peer).and_then(|peer| peer.uid) != Some(0) {
+    if peers.get(src_peer).and_then(|peer| peer.credentials.uid) != Some(0) {
         return status_action(frame, src_peer, UBUS_STATUS_PERMISSION_DENIED);
     }
-    match find(&frame.payload, UbusAttr::Method).and_then(|a| a.as_str()) {
+    match find(frame.payload, UbusAttr::Method).and_then(|a| a.as_str()) {
         Some("add") => {
             monitors.add(src_peer);
             status_action(frame, src_peer, 0)
@@ -635,17 +659,17 @@ fn dispatch_monitor_builtin(
 /// on the METHOD attr. Both `register` and `send` reply with a plain
 /// `STATUS(0)` echoing the request's seq/peer, exactly like upstream.
 fn dispatch_event_builtin(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
     objects: &ObjectRegistry,
     events: &mut EventRegistry,
 ) -> Vec<Action> {
-    let data = find(&frame.payload, UbusAttr::Data)
+    let data = find(frame.payload, UbusAttr::Data)
         .map(|a| a.payload)
         .unwrap_or(&[]);
-    match find(&frame.payload, UbusAttr::Method).and_then(|a| a.as_str()) {
+    match find(frame.payload, UbusAttr::Method).and_then(|a| a.as_str()) {
         Some("register") => {
             dispatch_event_register(frame, src_peer, cred, acl, objects, events, data)
         }
@@ -659,7 +683,7 @@ fn dispatch_event_builtin(
 /// string}`. The object must be one the caller owns (libubus registers
 /// an anonymous object first). Only a *trailing* `*` is a wildcard.
 fn dispatch_event_register(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
@@ -698,7 +722,7 @@ fn dispatch_event_register(
 /// `data` table out to every matching listener (the sender's own
 /// listeners are suppressed), then ack the sender with `STATUS(0)`.
 fn dispatch_event_send(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
@@ -768,7 +792,7 @@ pub(crate) fn object_remove_fanout(
 }
 
 fn dispatch_subscribe(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     cred: &Cred,
     acl: &AclRegistry,
@@ -776,14 +800,14 @@ fn dispatch_subscribe(
     objects: &ObjectRegistry,
     subs: &mut SubscriberRegistry,
 ) -> Vec<Action> {
-    let obj_id = match find(&frame.payload, UbusAttr::Target)
+    let obj_id = match find(frame.payload, UbusAttr::Target)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
     {
         Some(id) => id,
         None => return status_action(frame, src_peer, UBUS_STATUS_INVALID_ARGUMENT),
     };
-    let Some(subscriber_obj) = find(&frame.payload, UbusAttr::ObjId)
+    let Some(subscriber_obj) = find(frame.payload, UbusAttr::ObjId)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
         .filter(|id| objects.owner_of(*id) == Some(src_peer))
@@ -820,20 +844,20 @@ fn dispatch_subscribe(
 }
 
 fn dispatch_unsubscribe(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     peers: &mut PeerTable,
     objects: &ObjectRegistry,
     subs: &mut SubscriberRegistry,
 ) -> Vec<Action> {
-    let obj_id = match find(&frame.payload, UbusAttr::Target)
+    let obj_id = match find(frame.payload, UbusAttr::Target)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
     {
         Some(id) => id,
         None => return status_action(frame, src_peer, UBUS_STATUS_INVALID_ARGUMENT),
     };
-    let Some(subscriber_obj) = find(&frame.payload, UbusAttr::ObjId)
+    let Some(subscriber_obj) = find(frame.payload, UbusAttr::ObjId)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
         .filter(|id| objects.owner_of(*id) == Some(src_peer))
@@ -863,20 +887,20 @@ fn dispatch_unsubscribe(
 }
 
 fn dispatch_notify(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     peers: &PeerTable,
     objects: &ObjectRegistry,
     subs: &SubscriberRegistry,
 ) -> Vec<Action> {
-    let obj_id = match find(&frame.payload, UbusAttr::ObjId)
+    let obj_id = match find(frame.payload, UbusAttr::ObjId)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
     {
         Some(id) => id,
         None => return status_action(frame, src_peer, UBUS_STATUS_INVALID_ARGUMENT),
     };
-    if find(&frame.payload, UbusAttr::Method)
+    if find(frame.payload, UbusAttr::Method)
         .and_then(|a| a.as_str())
         .is_none()
     {
@@ -891,9 +915,9 @@ fn dispatch_notify(
     }
     let subscribers = subs.subscribers_of(obj_id);
     let subscriber_obj_ids: Vec<ObjectId> = subscribers.iter().map(|sub| sub.obj_id).collect();
-    let method = find(&frame.payload, UbusAttr::Method).and_then(|a| a.as_str());
-    let data = find(&frame.payload, UbusAttr::Data).map(|a| a.payload);
-    let no_reply = find(&frame.payload, UbusAttr::NoReply).is_some_and(|attr| attr.as_bool_int8());
+    let method = find(frame.payload, UbusAttr::Method).and_then(|a| a.as_str());
+    let data = find(frame.payload, UbusAttr::Data).map(|a| a.payload);
+    let no_reply = find(frame.payload, UbusAttr::NoReply).is_some_and(|attr| attr.as_bool_int8());
     let (user, group) = peer_names(peers, src_peer);
     let mut out = Vec::with_capacity(subscribers.len() + 1);
     if !no_reply {
@@ -902,28 +926,37 @@ fn dispatch_notify(
             reply::notify_ack(frame.hdr.seq, frame.hdr.peer, obj_id, &subscriber_obj_ids),
         ));
     }
-    out.extend(subscribers.iter().map(|sub| {
-        Action::SendBytes {
-            peer_id: sub.peer_id,
-            bytes: Codec::write_frame(&reply::stamped_invoke(
-                frame.hdr.seq,
-                src_peer,
-                sub.obj_id,
-                method,
-                user,
-                group,
-                data,
-                no_reply,
-            ))
-            .into(),
+    if let Some(first) = subscribers.first() {
+        let template = reply::stamped_invoke(
+            frame.hdr.seq,
+            src_peer,
+            first.obj_id,
+            method,
+            user,
+            group,
+            data,
+            no_reply,
+        );
+        let attr = find(&template.payload, UbusAttr::ObjId).expect("stamped invoke objid");
+        let offset = ubus::wire::HEADER_SIZE + attr.payload.as_ptr() as usize
+            - template.payload.as_ptr() as usize;
+        let bytes = Codec::write_frame(&template);
+        for subscriber in subscribers {
+            let mut encoded: Arc<[u8]> = Arc::from(bytes.as_slice());
+            Arc::get_mut(&mut encoded).expect("fresh fanout buffer")[offset..offset + 4]
+                .copy_from_slice(&subscriber.obj_id.get().to_be_bytes());
+            out.push(Action::SendBytes {
+                peer_id: subscriber.peer_id,
+                bytes: encoded,
+            });
         }
-    }));
+    }
     out
 }
 
-fn dispatch_ping(frame: &Frame, src_peer: PeerId) -> Vec<Action> {
+fn dispatch_ping(frame: &FrameRef<'_>, src_peer: PeerId) -> Vec<Action> {
     vec![
-        Action::send(src_peer, reply::data_echo(frame)),
+        Action::send(src_peer, reply::data_echo_ref(frame)),
         Action::send(
             src_peer,
             reply::status_reply(frame.hdr.seq, frame.hdr.peer, 0),
@@ -932,7 +965,7 @@ fn dispatch_ping(frame: &Frame, src_peer: PeerId) -> Vec<Action> {
 }
 
 fn forward_owner_response(
-    frame: &Frame,
+    frame: &FrameRef<'_>,
     src_peer: PeerId,
     objects: &ObjectRegistry,
     frame_fd: &mut Option<OwnedFd>,
@@ -952,7 +985,7 @@ fn forward_owner_response(
             return Vec::new();
         }
     };
-    let obj_id = match find(&frame.payload, UbusAttr::ObjId)
+    let obj_id = match find(frame.payload, UbusAttr::ObjId)
         .and_then(|a| a.as_u32())
         .and_then(ObjectId::new)
     {
@@ -963,8 +996,8 @@ fn forward_owner_response(
         return Vec::new();
     }
     let has_required_payload = match frame.hdr.ty {
-        MsgType::Data => find(&frame.payload, UbusAttr::Data).is_some(),
-        MsgType::Status => find(&frame.payload, UbusAttr::Status)
+        MsgType::Data => find(frame.payload, UbusAttr::Data).is_some(),
+        MsgType::Status => find(frame.payload, UbusAttr::Status)
             .and_then(|a| a.as_u32())
             .is_some(),
         _ => false,
@@ -972,7 +1005,7 @@ fn forward_owner_response(
     if !has_required_payload {
         return Vec::new();
     }
-    let mut out = frame.clone();
+    let mut out = (*frame).to_owned();
     out.hdr.peer = obj_id.get();
     vec![Action::SendTo {
         peer_id: dest,
@@ -985,7 +1018,7 @@ fn forward_owner_response(
 }
 
 /// Single-action reply with a bare status code (no obj-id payload).
-fn status_action(frame: &Frame, dest: PeerId, status: i32) -> Vec<Action> {
+fn status_action(frame: &FrameRef<'_>, dest: PeerId, status: i32) -> Vec<Action> {
     vec![Action::send(
         dest,
         reply::status_reply(frame.hdr.seq, frame.hdr.peer, status),
@@ -995,7 +1028,12 @@ fn status_action(frame: &Frame, dest: PeerId, status: i32) -> Vec<Action> {
 fn peer_names(peers: &PeerTable, peer_id: PeerId) -> (Option<&str>, Option<&str>) {
     peers
         .get(peer_id)
-        .map(|peer| (peer.user.as_deref(), peer.group.as_deref()))
+        .map(|peer| {
+            (
+                peer.credentials.user.as_deref(),
+                peer.credentials.group.as_deref(),
+            )
+        })
         .unwrap_or((None, None))
 }
 
@@ -1166,8 +1204,9 @@ mod tests {
 
     fn set_names(peers: &mut PeerTable, id: PeerId, user: &str, group: &str) {
         let peer = peers.get_mut(id).expect("peer exists");
-        peer.user = Some(user.to_string());
-        peer.group = Some(group.to_string());
+        let cred = Arc::make_mut(&mut peer.credentials);
+        cred.user = Some(user.to_string());
+        cred.group = Some(group.to_string());
     }
 
     fn install_user_peer(peers: &mut PeerTable, user: &str) -> PeerId {
@@ -3721,8 +3760,12 @@ mod tests {
 
         let (_, write_end) = rustix::pipe::pipe().unwrap();
         let mut status_fd = Some(write_end);
-        let status =
-            forward_owner_response(&response(MsgType::Status), owner, &objects, &mut status_fd);
+        let status = forward_owner_response(
+            &FrameRef::from(&response(MsgType::Status)),
+            owner,
+            &objects,
+            &mut status_fd,
+        );
         assert!(status_fd.is_none());
         assert!(matches!(
             status.as_slice(),
@@ -3731,7 +3774,12 @@ mod tests {
 
         let (_, write_end) = rustix::pipe::pipe().unwrap();
         let mut data_fd = Some(write_end);
-        let data = forward_owner_response(&response(MsgType::Data), owner, &objects, &mut data_fd);
+        let data = forward_owner_response(
+            &FrameRef::from(&response(MsgType::Data)),
+            owner,
+            &objects,
+            &mut data_fd,
+        );
         assert!(data_fd.is_some());
         assert!(matches!(data.as_slice(), [Action::SendTo { fd: None, .. }]));
     }

@@ -28,7 +28,7 @@
 //! routing target.
 
 use core::num::NonZeroU32;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::broker::BrokerError;
 use crate::peer::Peer;
@@ -217,12 +217,10 @@ pub struct ObjectRegistry {
     /// without a reverse scan. Anonymous objects have no path and
     /// therefore never enter LOOKUP list-all.
     by_id: HashMap<ObjectId, ObjectEntry>,
-    by_path: HashMap<String, ObjectId>,
-    /// Named registrations in insertion order. Stale ids are retained after
-    /// removal/replacement and filtered by `named_objects_of`, keeping the
-    /// hot insertion/removal paths simple while matching upstream's LIFO
-    /// per-client object list.
-    named_registration_order: Vec<ObjectId>,
+    by_path: BTreeMap<String, ObjectId>,
+    /// Live named registrations per owner. Monotonic IDs preserve upstream's
+    /// newest-first order without retaining deleted registration history.
+    named_by_owner: HashMap<PeerId, BTreeSet<ObjectId>>,
     /// Crate-visible only so the routing-test for AddObject exhaustion
     /// can fast-forward the allocator to its overflow boundary; not
     /// part of any public API.
@@ -239,8 +237,8 @@ impl ObjectRegistry {
     pub fn new() -> Self {
         Self {
             by_id: HashMap::new(),
-            by_path: HashMap::new(),
-            named_registration_order: Vec::new(),
+            by_path: BTreeMap::new(),
+            named_by_owner: HashMap::new(),
             next_id: FIRST_OBJ_ID.0,
         }
     }
@@ -258,10 +256,11 @@ impl ObjectRegistry {
         signature: Option<Vec<u8>>,
     ) -> Result<(ObjectId, Option<(ObjectId, PeerId)>), BrokerError> {
         let (id, obj_type) = self.allocate_object_and_type(signature)?;
-        let replaced = self
-            .by_path
-            .remove(&path)
-            .and_then(|prev| self.by_id.remove(&prev).map(|entry| (prev, entry.owner)));
+        let replaced = self.by_path.get(&path).copied().map(|previous| {
+            let owner = self.by_id[&previous].owner;
+            self.remove(previous);
+            (previous, owner)
+        });
         self.by_id.insert(
             id,
             ObjectEntry {
@@ -271,7 +270,7 @@ impl ObjectRegistry {
             },
         );
         self.by_path.insert(path, id);
-        self.named_registration_order.push(id);
+        self.named_by_owner.entry(owner).or_default().insert(id);
         Ok((id, replaced))
     }
 
@@ -336,18 +335,38 @@ impl ObjectRegistry {
     /// only when nothing carries the prefix at all. Anonymous objects
     /// have no path and never enter this set.
     pub fn any_path_with_prefix(&self, prefix: &str) -> bool {
-        self.by_path.keys().any(|p| p.starts_with(prefix))
+        self.by_path
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(path, _)| path.starts_with(prefix))
     }
 
     /// Snapshot of every (obj_id, path) pair. Used by LOOKUP's
     /// list-everything shape, which then sorts to match upstream
     /// `ubusd`'s AVL-walk emission order.
     pub fn iter_typed_paths(&self) -> impl Iterator<Item = (ObjectId, &str, &ObjectType)> {
-        self.by_id.iter().filter_map(|(id, entry)| {
-            let path = entry.path.as_deref()?;
-            let obj_type = entry.obj_type.as_ref()?;
-            Some((*id, path, obj_type))
+        self.by_path.iter().filter_map(|(path, id)| {
+            Some((*id, path.as_str(), self.by_id.get(id)?.obj_type.as_ref()?))
         })
+    }
+
+    /// Lexically ordered typed prefix matches, without cloning/sorting paths.
+    pub fn iter_typed_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = (ObjectId, &'a str, &'a ObjectType)> {
+        self.by_path
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |(path, _)| path.starts_with(prefix))
+            .filter_map(|(path, id)| {
+                Some((*id, path.as_str(), self.by_id.get(id)?.obj_type.as_ref()?))
+            })
     }
 
     /// owner peer-id for an obj-id, if registered.
@@ -369,9 +388,10 @@ impl ObjectRegistry {
     /// Named objects currently owned by `peer`, newest registration first.
     /// Anonymous objects are absent by construction.
     pub fn named_objects_of(&self, peer: PeerId) -> Vec<(ObjectId, &str)> {
-        self.named_registration_order
-            .iter()
-            .rev()
+        self.named_by_owner
+            .get(&peer)
+            .into_iter()
+            .flat_map(|ids| ids.iter().rev())
             .filter_map(|id| {
                 let entry = self.by_id.get(id)?;
                 (entry.owner == peer)
@@ -389,6 +409,12 @@ impl ObjectRegistry {
         };
         if let Some(path) = entry.path {
             self.by_path.remove(&path);
+            if let Some(ids) = self.named_by_owner.get_mut(&entry.owner) {
+                ids.remove(&obj_id);
+                if ids.is_empty() {
+                    self.named_by_owner.remove(&entry.owner);
+                }
+            }
         }
         true
     }
@@ -598,7 +624,7 @@ impl EventListener {
 /// event fan-out on its own broker-wide `obj_event_seq`.
 #[derive(Debug)]
 pub struct EventRegistry {
-    listeners: Vec<EventListener>,
+    listeners: BTreeMap<String, Vec<EventListener>>,
     next_seq: u16,
 }
 
@@ -658,7 +684,7 @@ impl EventRegistry {
     pub fn new() -> Self {
         // Upstream's first fan-out delivery carries seq 1.
         Self {
-            listeners: Vec::new(),
+            listeners: BTreeMap::new(),
             next_seq: 1,
         }
     }
@@ -667,22 +693,30 @@ impl EventRegistry {
     /// an exact duplicate (same peer, object, pattern) is a no-op so a
     /// refresh can't double-deliver.
     pub fn register(&mut self, prefix: String, partial: bool, peer_id: PeerId, obj_id: ObjectId) {
-        if self.listeners.iter().any(|l| {
-            l.peer_id == peer_id && l.obj_id == obj_id && l.partial == partial && l.prefix == prefix
+        let listeners = self.listeners.entry(prefix.clone()).or_default();
+        if listeners.iter().any(|listener| {
+            listener.peer_id == peer_id && listener.obj_id == obj_id && listener.partial == partial
         }) {
             return;
         }
-        self.listeners.push(EventListener {
-            prefix,
-            partial,
-            peer_id,
-            obj_id,
-        });
+        let at = listeners.partition_point(|listener| listener.obj_id <= obj_id);
+        listeners.insert(
+            at,
+            EventListener {
+                prefix,
+                partial,
+                peer_id,
+                obj_id,
+            },
+        );
     }
 
     /// Drop every listener owned by `peer` (it disconnected).
     pub fn remove_peer(&mut self, peer_id: PeerId) {
-        self.listeners.retain(|l| l.peer_id != peer_id);
+        self.listeners.retain(|_, listeners| {
+            listeners.retain(|listener| listener.peer_id != peer_id);
+            !listeners.is_empty()
+        });
     }
 
     /// Drop every listener registered against `obj_id` (its object was
@@ -691,7 +725,10 @@ impl EventRegistry {
     /// `ubusd_free_object()` — so a REMOVE_OBJECT ends the registration,
     /// not just a disconnect.
     pub fn remove_object(&mut self, obj_id: ObjectId) {
-        self.listeners.retain(|l| l.obj_id != obj_id);
+        self.listeners.retain(|_, listeners| {
+            listeners.retain(|listener| listener.obj_id != obj_id);
+            !listeners.is_empty()
+        });
     }
 
     /// Post-increment the global fan-out seq (wraps like any wire seq).
@@ -711,14 +748,31 @@ impl EventRegistry {
         event_id: &str,
         exclude: Option<PeerId>,
     ) -> Vec<(PeerId, ObjectId)> {
-        let mut hits: Vec<&EventListener> = self
-            .listeners
-            .iter()
-            .filter(|l| Some(l.peer_id) != exclude)
-            .filter(|l| l.matches(event_id))
-            .collect();
-        hits.sort_by(|a, b| a.prefix.cmp(&b.prefix).then(a.obj_id.cmp(&b.obj_id)));
-        hits.into_iter().map(|l| (l.peer_id, l.obj_id)).collect()
+        let mut matches = Vec::new();
+        let mut visit = |listeners: &[EventListener]| {
+            matches.extend(
+                listeners
+                    .iter()
+                    .filter(|listener| {
+                        Some(listener.peer_id) != exclude && listener.matches(event_id)
+                    })
+                    .map(|listener| (listener.peer_id, listener.obj_id)),
+            );
+        };
+        // Only prefixes can match. Avoid a length-driven quadratic search on
+        // unusually long names by scanning the smaller live index instead.
+        if event_id.len() < self.listeners.len() {
+            for end in (0..=event_id.len()).filter(|&end| event_id.is_char_boundary(end)) {
+                if let Some(listeners) = self.listeners.get(&event_id[..end]) {
+                    visit(listeners);
+                }
+            }
+        } else {
+            for listeners in self.listeners.values() {
+                visit(listeners);
+            }
+        }
+        matches
     }
 }
 
@@ -728,6 +782,26 @@ mod tests {
 
     fn pid(n: u32) -> PeerId {
         PeerId::new(n).unwrap()
+    }
+
+    #[test]
+    fn registration_churn_keeps_only_live_owner_entries() {
+        let mut objects = ObjectRegistry::new();
+        let owner = pid(1025);
+        let survivor = objects.insert("keep".into(), owner, None).unwrap().0;
+        for _ in 0..4096 {
+            let first = objects.insert("churn".into(), owner, None).unwrap().0;
+            let (second, replaced) = objects.insert("churn".into(), pid(1026), None).unwrap();
+            assert_eq!(replaced, Some((first, owner)));
+            assert!(objects.remove(second));
+            assert_eq!(objects.named_by_owner.len(), 1);
+            assert_eq!(objects.named_by_owner[&owner].len(), 1);
+        }
+        assert_eq!(objects.named_objects_of(owner), vec![(survivor, "keep")]);
+        objects.drop_owned_by(&[survivor]);
+        assert!(objects.named_by_owner.is_empty());
+        assert!(objects.by_path.is_empty());
+        assert!(objects.by_id.is_empty());
     }
 
     #[test]

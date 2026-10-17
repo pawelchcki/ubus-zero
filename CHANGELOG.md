@@ -22,6 +22,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- Broker CPU/RSS counters, trial uncertainty intervals, compiler-profile and
+  allocation diagnostics, and verified registry/ACL/idle-peer/fanout benchmarks.
 - A verified 32-request pipelined ping benchmark to cover broker batching, and
   same-machine comparisons of C, baseline Rust and current Rust using a Git ref.
 - Reproducible Rust/OpenWrt broker benchmarks with verified protocol workloads,
@@ -39,6 +41,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Full-workspace upstream drift checks and concurrent fault-profile runs.
 
 ### Fixed
+
+- Verify relay descriptor closure with per-pipe EOF instead of process-wide FD
+  counts that race parallel tests.
+- Reset the request idle budget on accepted DATA so long object listings do
+  not time out while progressing; silence and unrelated traffic remain bounded.
+- Bound named-object history to live registrations and preserve last-valid
+  duplicate protocol attributes like the pinned OpenWrt parser.
+- Use Linux epoll for active-peer dispatch and optimize the host daemon at
+  release level 3 while keeping the public no_std library size-oriented.
+- Reduce broker credential copies, frame allocations, buffer compaction and
+  descriptor-free reply syscalls; index path/owner/event lookups and reuse
+  NOTIFY encoding while retaining FD, monitor and backpressure behavior.
 
 - Reduce large-message broker receive syscalls with a shared adaptive buffer,
   while preserving batching and descriptor boundaries.

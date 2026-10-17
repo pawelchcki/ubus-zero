@@ -19,7 +19,9 @@ use std::ffi::CStr;
 use std::io;
 use std::mem::MaybeUninit;
 
-use rustix::event::{poll, PollFd, PollFlags, Timespec};
+#[cfg(any(test, not(target_os = "linux")))]
+use rustix::event::{poll, PollFd};
+use rustix::event::{PollFlags, Timespec};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::io::{IoSlice, IoSliceMut};
@@ -30,7 +32,7 @@ use rustix::net::{
 
 use ubus::blobmsg::BlobMsgTable;
 use ubus::error::UbusError;
-use ubus::wire::{Codec, Frame};
+use ubus::wire::{Codec, Frame, FrameRef};
 
 use crate::acl::{apply_reload, AclRegistry};
 use crate::peer::{Peer, MAX_RX_BUF_BYTES, MAX_TX_BUF_BYTES, RX_FD_WINDOW};
@@ -169,11 +171,16 @@ pub struct Broker {
     pending_close: HashSet<PeerId>,
     /// Reusable scratch for `poll_once`. Cleared and refilled each
     /// tick so the steady-state allocation count is zero.
+    #[cfg(any(test, not(target_os = "linux")))]
     live_ids_buf: Vec<PeerId>,
+    #[cfg(target_os = "linux")]
+    poller: crate::poller::Poller,
+    tx_ready: HashSet<PeerId>,
     peer_revents_buf: Vec<(PeerId, PollFlags)>,
     /// Reused across peers. Grow only for a declared frame body, capped at
     /// 64 KiB, so large messages do not require one syscall per 4 KiB.
     rx_scratch: Vec<u8>,
+    tx_scratch: Vec<u8>,
 }
 
 impl Broker {
@@ -213,6 +220,9 @@ impl Broker {
                 config.socket_path,
             );
         }
+        #[cfg(target_os = "linux")]
+        let poller =
+            crate::poller::Poller::new(&fd).map_err(|e| BrokerError::op("epoll_create", e))?;
         let mut broker = Self {
             config,
             listen_fd: fd,
@@ -226,9 +236,14 @@ impl Broker {
             wake_pipe: None,
             shutdown: false,
             pending_close: HashSet::new(),
+            #[cfg(any(test, not(target_os = "linux")))]
             live_ids_buf: Vec::new(),
+            #[cfg(target_os = "linux")]
+            poller,
+            tx_ready: HashSet::new(),
             peer_revents_buf: Vec::new(),
             rx_scratch: vec![0; 4096],
+            tx_scratch: Vec::with_capacity(4096),
         };
         if acl_load.had_candidates {
             broker.broadcast_acl_sequence();
@@ -247,6 +262,16 @@ impl Broker {
         if let Err(e) = rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK) {
             log::warn!("ubusd: wake pipe O_NONBLOCK failed: {e:?}; leaving pipe unset");
             return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(error) = self.poller.add_wake(&fd) {
+                log::warn!("ubusd: register wake pipe failed: {error:?}");
+                return;
+            }
+            if let Some(old) = &self.wake_pipe {
+                let _ = self.poller.remove(old);
+            }
         }
         self.wake_pipe = Some(fd);
     }
@@ -274,13 +299,79 @@ impl Broker {
     /// work, leaving the host event loop free to tick its other
     /// duties between broker polls.
     pub fn poll_once(&mut self, timeout_ms: i32) -> Result<(), BrokerError> {
-        self.peers.live_ids_into(&mut self.live_ids_buf);
         self.peer_revents_buf.clear();
-        // The PollFd values borrow from `self.listen_fd` and each
-        // peer's fd, which would clash with the mutable ops below.
-        // Build the pollset, run poll(2), then extract revents into
-        // `peer_revents_buf` (keyed by peer-id) and drop the borrow
-        // before entering the dispatch / drain phases.
+        let timeout_ms = if !self.tx_ready.is_empty() || !self.pending_close.is_empty() {
+            0
+        } else {
+            timeout_ms
+        };
+        let (listen_revents, wake_revents) = match self.wait_ready(timeout_ms) {
+            Ok(ready) => ready,
+            Err(Errno::INTR) => return Ok(()),
+            Err(error) => return Err(BrokerError::op("readiness wait", error)),
+        };
+
+        if wake_revents.is_some_and(|flags| flags.contains(PollFlags::IN)) {
+            self.drain_wake_pipe();
+        }
+        if listen_revents.intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP) {
+            self.accept_pending()?;
+        }
+        for i in 0..self.peer_revents_buf.len() {
+            let (id, revents) = self.peer_revents_buf[i];
+            if revents.contains(PollFlags::ERR) {
+                // POLLERR means the kernel has a pending socket-level
+                // fault (firewall reset, ICMP error). Distinct from
+                // POLLHUP — a clean peer close vs. an L4 abort look
+                // identical in logs otherwise.
+                log::debug!("ubusd: peer {id} POLLERR, closing");
+                self.pending_close.insert(id);
+                continue;
+            }
+            // POLLHUP and POLLIN can fire together: a peer that does
+            // `send(LAST_FRAME); close()` produces both at once. Drain
+            // first so the final frame still dispatches; the close
+            // gets scheduled either way (read_into_buf returns false
+            // on EOF, drain_rx_and_dispatch routes that into
+            // pending_close).
+            if revents.contains(PollFlags::IN) {
+                self.drain_rx_and_dispatch(id, revents.contains(PollFlags::HUP));
+            }
+            if revents.contains(PollFlags::HUP) {
+                self.pending_close.insert(id);
+            }
+        }
+        self.tx_ready
+            .extend(self.peer_revents_buf.iter().map(|(id, _)| *id));
+        let mut ready = std::mem::take(&mut self.tx_ready);
+        for id in ready.drain() {
+            self.drain_tx(id);
+            self.sync_write_interest(id);
+        }
+        self.tx_ready = ready;
+        let to_close: Vec<PeerId> = self.pending_close.drain().collect();
+        for id in to_close {
+            self.close_peer(id);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_ready(&mut self, timeout_ms: i32) -> Result<(PollFlags, Option<PollFlags>), Errno> {
+        self.poller.wait(
+            poll_timeout(timeout_ms).as_ref(),
+            &mut self.peer_revents_buf,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn wait_ready(&mut self, timeout_ms: i32) -> Result<(PollFlags, Option<PollFlags>), Errno> {
+        self.wait_poll(timeout_ms)
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    fn wait_poll(&mut self, timeout_ms: i32) -> Result<(PollFlags, Option<PollFlags>), Errno> {
+        self.peers.live_ids_into(&mut self.live_ids_buf);
         let listen_revents;
         let wake_revents;
         {
@@ -313,8 +404,7 @@ impl Broker {
             let timeout_ts = poll_timeout(timeout_ms);
             match poll(&mut fds, timeout_ts.as_ref()) {
                 Ok(_) => {}
-                Err(Errno::INTR) => return Ok(()),
-                Err(e) => return Err(BrokerError::op("poll", e)),
+                Err(e) => return Err(e),
             }
             listen_revents = fds[0].revents();
             let peer_start = 1 + usize::from(self.wake_pipe.is_some());
@@ -327,45 +417,26 @@ impl Broker {
             );
         }
 
-        if wake_revents.is_some_and(|flags| flags.contains(PollFlags::IN)) {
-            self.drain_wake_pipe();
-        }
-        if listen_revents.intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP) {
-            self.accept_pending()?;
-        }
-        for i in 0..self.peer_revents_buf.len() {
-            let (id, revents) = self.peer_revents_buf[i];
-            if revents.contains(PollFlags::ERR) {
-                // POLLERR means the kernel has a pending socket-level
-                // fault (firewall reset, ICMP error). Distinct from
-                // POLLHUP — a clean peer close vs. an L4 abort look
-                // identical in logs otherwise.
-                log::debug!("ubusd: peer {id} POLLERR, closing");
-                self.pending_close.insert(id);
-                continue;
-            }
-            // POLLHUP and POLLIN can fire together: a peer that does
-            // `send(LAST_FRAME); close()` produces both at once. Drain
-            // first so the final frame still dispatches; the close
-            // gets scheduled either way (read_into_buf returns false
-            // on EOF, drain_rx_and_dispatch routes that into
-            // pending_close).
-            if revents.contains(PollFlags::IN) {
-                self.drain_rx_and_dispatch(id);
-            }
-            if revents.contains(PollFlags::HUP) {
-                self.pending_close.insert(id);
+        Ok((listen_revents, wake_revents))
+    }
+
+    fn sync_write_interest(&mut self, id: PeerId) {
+        #[cfg(target_os = "linux")]
+        if let Some(peer) = self.peers.get_mut(id) {
+            let pending = peer.has_pending_tx();
+            if pending != peer.write_interest {
+                if let Some(fd) = &peer.fd {
+                    if let Err(error) = self.poller.writable(fd, id, pending) {
+                        log::warn!("ubusd: update peer {id} readiness failed: {error:?}");
+                        self.pending_close.insert(id);
+                        return;
+                    }
+                }
+                peer.write_interest = pending;
             }
         }
-        for i in 0..self.peer_revents_buf.len() {
-            let id = self.peer_revents_buf[i].0;
-            self.drain_tx(id);
-        }
-        let to_close: Vec<PeerId> = self.pending_close.drain().collect();
-        for id in to_close {
-            self.close_peer(id);
-        }
-        Ok(())
+        #[cfg(not(target_os = "linux"))]
+        let _ = id;
     }
 
     fn drain_wake_pipe(&mut self) {
@@ -459,11 +530,28 @@ impl Broker {
                     };
                     #[cfg(feature = "testing")]
                     let uid = peer_uid_override.or(uid);
-                    let mut peer = Peer::new(fd, uid, user, group);
-                    peer.gid = gid;
-                    peer.extra_gids = extra_gids;
+                    let peer = Peer::with_credentials(
+                        fd,
+                        crate::acl::Cred {
+                            uid,
+                            gid,
+                            user,
+                            group,
+                            extra_gids,
+                        },
+                    );
                     match self.peers.insert(peer) {
                         Ok((id, _)) => {
+                            #[cfg(target_os = "linux")]
+                            if let Some(fd) = self.peers.get(id).and_then(|peer| peer.fd.as_ref()) {
+                                if let Err(error) = self.poller.add_peer(fd, id) {
+                                    log::warn!(
+                                        "ubusd: register peer {id} readiness failed: {error:?}"
+                                    );
+                                    self.pending_close.insert(id);
+                                    continue;
+                                }
+                            }
                             log::debug!("ubusd: accepted peer {id}");
                             // Match upstream `ubusd`: push HELLO unsolicited
                             // at accept time (seq=0, peer=assigned id), so
@@ -517,69 +605,98 @@ impl Broker {
         }
     }
 
-    fn drain_rx_and_dispatch(&mut self, peer_id: PeerId) {
-        // Borrow the peer mutably for the read; drop the borrow
-        // before reaching back into self for dispatch (which needs
-        // the registries borrowed mutably alongside the peer table).
-        let mut frames: Vec<(Frame, Option<OwnedFd>)> = Vec::new();
-        let mut close = false;
-        if let Some(peer) = self.peers.get_mut(peer_id) {
-            close = !read_into_buf(peer, peer_id, &mut self.rx_scratch);
-            loop {
-                // A socket frame always has a four-byte outer blob header.
-                // The codec also supports standalone eight-byte headers for
-                // in-memory callers; do not mistake a fragmented wire header
-                // for such a complete frame.
-                if peer.rx_buf.len() < RX_FD_WINDOW {
+    fn drain_rx_and_dispatch(&mut self, peer_id: PeerId, drain_eof: bool) {
+        let Some(peer) = self.peers.get_mut(peer_id) else {
+            return;
+        };
+        let mut close = !read_into_buf_available(peer, peer_id, &mut self.rx_scratch, !drain_eof);
+        // Own this buffer locally so borrowed payloads survive registry mutation.
+        // The connection remains live until the poll loop's deferred reaper.
+        let mut bytes = std::mem::take(&mut peer.rx_buf);
+        let start = peer.rx_abs;
+        let mut consumed = 0;
+        while bytes.len() - consumed >= RX_FD_WINDOW {
+            match Codec::read_frame_borrowed_lenient_version(&bytes[consumed..]) {
+                Ok((frame, size)) => {
+                    let mut fd = self
+                        .peers
+                        .get_mut(peer_id)
+                        .and_then(|peer| peer.take_rx_fd(start.saturating_add(consumed)));
+                    consumed += size;
+                    self.mirror_inbound(peer_id, &frame);
+                    let actions = routing::dispatch_ref(
+                        &frame,
+                        peer_id,
+                        &self.acl,
+                        self.acl_sequence,
+                        &mut self.peers,
+                        &mut self.objects,
+                        &mut self.subs,
+                        &mut self.events,
+                        &mut self.monitors,
+                        &mut fd,
+                    );
+                    drop(fd);
+                    self.apply_actions(actions);
+                }
+                Err(UbusError::Short { .. }) => break,
+                Err(error) => {
+                    log::warn!("ubusd: peer {peer_id} malformed frame ({error:?}); closing");
+                    close = true;
                     break;
                 }
-                // Frame-size parity rides the codec's MAX_MSG_LEN check:
-                // upstream accepts attr_len <= 1 MiB and closes above.
-                match Codec::read_frame_lenient_version(&peer.rx_buf) {
-                    Ok((frame, n)) => {
-                        // Claim this frame's fd at its own stream offset
-                        // before advancing past it: every fd-bearing
-                        // frame in a pipelined batch keeps its own.
-                        let fd = peer.take_rx_fd(peer.rx_abs);
-                        peer.rx_buf.drain(..n);
-                        peer.rx_abs = peer.rx_abs.saturating_add(n);
-                        frames.push((frame, fd));
-                    }
-                    Err(UbusError::Short { .. }) => break,
-                    Err(e) => {
-                        log::warn!("ubusd: peer {peer_id} malformed frame ({e:?}); closing");
-                        close = true;
-                        break;
-                    }
-                }
             }
-            if peer.rx_buf.len() > MAX_RX_BUF_BYTES {
-                log::warn!("ubusd: peer {peer_id} rx_buf too large, closing");
-                close = true;
-            }
+        }
+        bytes.drain(..consumed);
+        if bytes.is_empty() && bytes.capacity() > 64 * 1024 {
+            bytes.shrink_to(4096);
+        }
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            peer.rx_abs = start.saturating_add(consumed);
+            peer.rx_buf = bytes;
         }
         if close {
             self.pending_close.insert(peer_id);
         }
-        for (frame, mut frame_fd) in frames {
-            self.mirror_inbound(peer_id, &frame);
-            let actions = routing::dispatch(
-                &frame,
-                peer_id,
-                &self.acl,
-                self.acl_sequence,
-                &mut self.peers,
-                &mut self.objects,
-                &mut self.subs,
-                &mut self.events,
-                &mut self.monitors,
-                &mut frame_fd,
-            );
-            // Routing takes only the two relay cases; every other inbound
-            // SCM_RIGHTS fd is intentionally closed here.
-            drop(frame_fd);
-            for a in actions {
-                self.apply_action(a);
+    }
+
+    /// Coalesce consecutive descriptor-free replies without changing per-peer
+    /// order. Monitor records retain their existing one-frame send boundary.
+    fn apply_actions(&mut self, actions: Vec<Action>) {
+        if !self.monitors.is_empty() {
+            for action in actions {
+                self.apply_action(action);
+            }
+            return;
+        }
+        let mut actions = actions.into_iter().peekable();
+        while let Some(action) = actions.next() {
+            match action {
+                Action::SendTo {
+                    peer_id,
+                    frame,
+                    fd: None,
+                } => {
+                    let mut bytes = std::mem::take(&mut self.tx_scratch);
+                    Codec::write_frame_into(&frame, &mut bytes);
+                    while let Some(Action::SendTo {
+                        peer_id: next,
+                        frame,
+                        fd: None,
+                    }) = actions.peek()
+                    {
+                        if *next != peer_id || bytes.len() + 8 + frame.payload.len() > 64 * 1024 {
+                            break;
+                        }
+                        if let Some(Action::SendTo { frame, .. }) = actions.next() {
+                            bytes.extend_from_slice(&frame.hdr.encode());
+                            bytes.extend_from_slice(&frame.payload);
+                        }
+                    }
+                    self.send_encoded(peer_id, &bytes);
+                    self.tx_scratch = bytes;
+                }
+                other => self.apply_action(other),
             }
         }
     }
@@ -587,11 +704,13 @@ impl Broker {
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::SendTo { peer_id, frame, fd } => {
-                let bytes = Codec::write_frame(&frame);
+                let mut bytes = std::mem::take(&mut self.tx_scratch);
+                Codec::write_frame_into(&frame, &mut bytes);
                 match fd {
                     Some(fd) => self.send_encoded_with_fd(peer_id, &bytes, fd),
                     None => self.send_encoded(peer_id, &bytes),
                 }
+                self.tx_scratch = bytes;
             }
             Action::SendBytes { peer_id, bytes } => {
                 self.send_encoded(peer_id, &bytes);
@@ -607,8 +726,10 @@ impl Broker {
     /// `poll_once` drain it. The common case (uncontended kernel
     /// buffer) costs zero extra syscalls vs. always-buffer.
     fn enqueue_to_peer(&mut self, peer_id: PeerId, frame: &Frame) {
-        let bytes = Codec::write_frame(frame);
+        let mut bytes = std::mem::take(&mut self.tx_scratch);
+        Codec::write_frame_into(frame, &mut bytes);
         self.send_encoded(peer_id, &bytes);
+        self.tx_scratch = bytes;
     }
 
     /// Mirror-aware outgoing choke point for all ordinary broker sends.
@@ -695,6 +816,8 @@ impl Broker {
         }
         peer.tx_fds.push_back((peer.tx_enq_abs, fd));
         peer.enqueue(bytes);
+        self.tx_ready.insert(peer_id);
+        self.sync_write_interest(peer_id);
     }
 
     fn mirror_outbound(&mut self, dest: PeerId, bytes: &[u8]) {
@@ -722,7 +845,7 @@ impl Broker {
         self.enqueue_mirrors(frame);
     }
 
-    fn mirror_inbound(&mut self, src: PeerId, frame: &Frame) {
+    fn mirror_inbound(&mut self, src: PeerId, frame: &FrameRef<'_>) {
         if self.monitors.is_empty() {
             return;
         }
@@ -756,6 +879,8 @@ impl Broker {
             return;
         }
         peer.enqueue(bytes);
+        self.tx_ready.insert(peer_id);
+        self.sync_write_interest(peer_id);
     }
 
     fn drain_tx(&mut self, peer_id: PeerId) {
@@ -789,6 +914,9 @@ impl Broker {
             }
             let (front, back) = peer.tx_buf.as_slices();
             if front.is_empty() && back.is_empty() {
+                if peer.tx_buf.capacity() > 64 * 1024 {
+                    peer.tx_buf.shrink_to(4096);
+                }
                 return;
             }
             let buf = if !front.is_empty() { front } else { back };
@@ -919,6 +1047,11 @@ impl Broker {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = self.peers.get(peer_id).and_then(|peer| peer.fd.as_ref()) {
+            let _ = self.poller.remove(fd);
+        }
+        self.tx_ready.remove(&peer_id);
         let _ = self.peers.remove(peer_id);
         log::debug!(
             "ubusd: peer {peer_id} closed; reaped {} objects",
@@ -1105,7 +1238,17 @@ fn rx_frame_window(peer: &Peer, frame_start: &mut usize) -> Option<(usize, bool)
 
 /// Read everything currently queued on `peer.fd` into `peer.rx_buf`.
 /// Returns `false` if the peer hung up — caller schedules a close.
+#[cfg(test)]
 fn read_into_buf(peer: &mut Peer, peer_id: PeerId, scratch: &mut Vec<u8>) -> bool {
+    read_into_buf_available(peer, peer_id, scratch, false)
+}
+
+fn read_into_buf_available(
+    peer: &mut Peer,
+    peer_id: PeerId,
+    scratch: &mut Vec<u8>,
+    stop_after_short: bool,
+) -> bool {
     let fd = match peer.fd.as_ref() {
         Some(f) => f,
         None => {
@@ -1191,6 +1334,12 @@ fn read_into_buf(peer: &mut Peer, peer_id: PeerId, scratch: &mut Vec<u8>) -> boo
                     return false;
                 }
                 peer.rx_buf.extend_from_slice(&scratch[..received.bytes]);
+                // Level-triggered poll will report subsequently appended data.
+                // On HUP the caller disables this shortcut and drains to EOF;
+                // descriptor-bearing reads always retain the framing loop.
+                if stop_after_short && batch.is_some_and(|size| size < scratch.len()) {
+                    return true;
+                }
             }
             Err(Errno::AGAIN) => return true,
             Err(Errno::INTR) => continue,
@@ -1453,6 +1602,27 @@ mod tests {
 
     fn pid(n: u32) -> PeerId {
         PeerId::new(n).unwrap()
+    }
+
+    #[test]
+    fn portable_and_native_readiness_report_listener_and_wake() {
+        let path = ubus_testkit::unique_socket_path("ready");
+        let mut broker = Broker::bind(Config {
+            socket_path: path.to_str().unwrap().into(),
+            ..Config::default()
+        })
+        .unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (read, write) = rustix::pipe::pipe().unwrap();
+        broker.set_wake_pipe(read);
+        rustix::io::write(&write, b"H").unwrap();
+        let portable = broker.wait_poll(0).unwrap();
+        assert!(portable.0.contains(PollFlags::IN));
+        assert!(portable.1.unwrap().contains(PollFlags::IN));
+        broker.peer_revents_buf.clear();
+        let native = broker.wait_ready(0).unwrap();
+        assert!(native.0.contains(PollFlags::IN));
+        assert!(native.1.unwrap().contains(PollFlags::IN));
     }
 
     #[test]
